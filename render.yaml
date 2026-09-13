@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: pycodecommenter-ai-backend
+    name: pycodecommenter-backend
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
