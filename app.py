@@ -1,7 +1,7 @@
 """Flask app factory for the PyCodeCommenter AI-drafting backend.
 
 Run locally with `flask --app app run` or `python app.py`; in production,
-Render starts it with `gunicorn app:app` (see Procfile).
+Render starts it with `gunicorn "app:create_app()"` (see Procfile).
 """
 
 from __future__ import annotations

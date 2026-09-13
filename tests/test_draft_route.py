@@ -7,6 +7,31 @@ def test_health_check_returns_ok(client):
     assert response.get_json() == {"status": "ok"}
 
 
+def test_health_check_is_never_rate_limited(fake_config):
+    """Regression test: /health must never be rate-limited, no matter how
+    strict the drafting endpoint's limit is. Render polls /health every
+    ~5s for its own liveness check; if that ever gets 429'd, Render marks
+    the whole service unhealthy and stops routing real traffic to it --
+    confirmed live in production. A strict "1 per hour" limit on the
+    drafting endpoint must not touch /health at all."""
+    from app import create_app
+
+    strict_config = fake_config.__class__(
+        gemini_api_keys=fake_config.gemini_api_keys,
+        rate_limit="1 per hour",
+        max_daily_calls=fake_config.max_daily_calls,
+        gemini_model=fake_config.gemini_model,
+        request_timeout_s=fake_config.request_timeout_s,
+    )
+    app = create_app(config=strict_config)
+    app.config["TESTING"] = True
+    client = app.test_client()
+
+    responses = [client.get("/health") for _ in range(20)]
+
+    assert all(r.status_code == 200 for r in responses)
+
+
 def test_draft_description_success(client, app, valid_payload, monkeypatch):
     gemini_client: GeminiClient = app.config["GEMINI_CLIENT"]
     monkeypatch.setattr(

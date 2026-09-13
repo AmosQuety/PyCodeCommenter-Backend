@@ -22,6 +22,7 @@ import time
 from flask import Blueprint, Response, current_app, jsonify, request
 
 from gemini_client import draft_request_from_dict
+from middleware.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,14 @@ bp = Blueprint("draft", __name__)
 
 @bp.get("/health")
 def health() -> Response:
+    # Deliberately not rate-limited -- see middleware/rate_limit.py's
+    # module docstring for why a limited health check took the whole
+    # service down in production.
     return jsonify({"status": "ok"})
 
 
 @bp.post("/v1/draft-description")
+@limiter.limit(lambda: current_app.config["RATE_LIMIT"])
 def draft_description() -> Response:
     daily_cap = current_app.config["DAILY_CAP"]
     if not daily_cap.try_consume():
