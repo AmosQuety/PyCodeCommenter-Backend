@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: pycodecommenter-ai-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn "app:create_app()"
+    healthCheckPath: /health
+    envVars:
+      - key: Gemini_api_keys
+        sync: false
+      - key: RATE_LIMIT
+        value: "10 per minute"
+      - key: MAX_DAILY_CALLS
+        value: "200"
