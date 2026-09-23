@@ -6,6 +6,8 @@ from gemini_client import (
     DraftRequest,
     GeminiClient,
     ParameterFact,
+    _KeyUnavailableError,
+    _ModelUnavailableError,
     draft_request_from_dict,
 )
 
@@ -36,7 +38,7 @@ def test_requires_at_least_one_key():
 
 def test_successful_draft_returns_trimmed_text(monkeypatch):
     client = make_client()
-    monkeypatch.setattr(client, "_post", lambda key, prompt: "  A function.  ")
+    monkeypatch.setattr(client, "_post", lambda key, model, prompt: "  A function.  ")
 
     result = client.draft_description(make_request())
 
@@ -45,7 +47,7 @@ def test_successful_draft_returns_trimmed_text(monkeypatch):
 
 def test_empty_response_is_treated_as_decline(monkeypatch):
     client = make_client()
-    monkeypatch.setattr(client, "_post", lambda key, prompt: "")
+    monkeypatch.setattr(client, "_post", lambda key, model, prompt: "")
 
     assert client.draft_description(make_request()) is None
 
@@ -56,7 +58,9 @@ def test_mid_sentence_cutoff_is_never_served_as_a_finished_fact(monkeypatch):
     is at"). That must never be served as a trustworthy finished fact."""
     client = make_client()
     monkeypatch.setattr(
-        client, "_post", lambda key, prompt: "This function determines whether it is at"
+        client,
+        "_post",
+        lambda key, model, prompt: "This function determines whether it is at",
     )
 
     assert client.draft_description(make_request()) is None
@@ -65,7 +69,7 @@ def test_mid_sentence_cutoff_is_never_served_as_a_finished_fact(monkeypatch):
 def test_complete_sentence_ending_in_a_quote_is_accepted(monkeypatch):
     client = make_client()
     monkeypatch.setattr(
-        client, "_post", lambda key, prompt: 'It returns the value "done."'
+        client, "_post", lambda key, model, prompt: 'It returns the value "done."'
     )
 
     assert client.draft_description(make_request()) == 'It returns the value "done."'
@@ -74,7 +78,7 @@ def test_complete_sentence_ending_in_a_quote_is_accepted(monkeypatch):
 def test_all_keys_exhausted_returns_none(monkeypatch):
     client = make_client(api_keys=["key-1", "key-2"])
 
-    def always_fail(key, prompt):
+    def always_fail(key, model, prompt):
         raise ConnectionError("boom")
 
     monkeypatch.setattr(client, "_post", always_fail)
@@ -86,12 +90,12 @@ def test_429_opens_circuit_and_skips_key_on_next_call(monkeypatch):
     client = make_client(api_keys=["key-1", "key-2"])
     calls = []
 
-    def fake_post(key, prompt):
+    def fake_post(key, model, prompt):
         calls.append(key)
         if key == "key-1":
-            from gemini_client import _QuotaExceededError
+            from gemini_client import _KeyUnavailableError
 
-            raise _QuotaExceededError("quota")
+            raise _KeyUnavailableError("quota")
         return "described by key-2."
 
     monkeypatch.setattr(client, "_post", fake_post)
@@ -110,7 +114,7 @@ def test_non_quota_failure_retries_once_before_moving_to_next_key(monkeypatch):
     client = make_client(api_keys=["key-1", "key-2"])
     attempts = {"key-1": 0}
 
-    def fake_post(key, prompt):
+    def fake_post(key, model, prompt):
         if key == "key-1":
             attempts["key-1"] += 1
             raise ConnectionError("transient")
@@ -127,7 +131,9 @@ def test_non_quota_failure_retries_once_before_moving_to_next_key(monkeypatch):
 def test_two_consecutive_non_quota_failures_open_the_circuit(monkeypatch):
     client = make_client(api_keys=["key-1"])
     monkeypatch.setattr(
-        client, "_post", lambda key, prompt: (_ for _ in ()).throw(ConnectionError())
+        client,
+        "_post",
+        lambda key, model, prompt: (_ for _ in ()).throw(ConnectionError()),
     )
 
     client.draft_description(make_request())
@@ -137,29 +143,67 @@ def test_two_consecutive_non_quota_failures_open_the_circuit(monkeypatch):
     assert state.open_until > time.monotonic()
 
 
-def test_model_discovery_prefers_stable_alias(monkeypatch):
+def _models_payload(*names):
+    return {
+        "models": [
+            {"name": f"models/{n}", "supportedGenerationMethods": ["generateContent"]}
+            for n in names
+        ]
+    }
+
+
+def test_model_discovery_prefers_stable_alias_then_stable_flash_models(monkeypatch):
     client = make_client(model=None)
     monkeypatch.setattr(
         client,
         "_list_models",
-        lambda api_key: {
-            "models": [
-                {
-                    "name": "models/gemini-flash-latest",
-                    "supportedGenerationMethods": ["generateContent"],
-                },
-                {
-                    "name": "models/gemini-2.0-flash-exp",
-                    "supportedGenerationMethods": ["generateContent"],
-                },
-            ]
-        },
+        lambda api_key: _models_payload(
+            "gemini-3.5-flash",
+            "gemini-2.5-flash",
+            "gemini-flash-latest",
+            "gemini-2.0-flash-exp",
+        ),
     )
 
-    assert client._resolve_model("key-1") == "gemini-flash-latest"
+    assert client._candidate_models("key-1") == [
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash",
+    ]
 
 
-def test_model_discovery_falls_back_to_constant_on_failure(monkeypatch):
+def test_model_discovery_excludes_variants_that_cannot_serve_text(monkeypatch):
+    """Observed live: flash-lite rejects thinkingBudget=0 (HTTP 400), and
+    image/TTS variants don't produce text at all."""
+    client = make_client(model=None)
+    monkeypatch.setattr(
+        client,
+        "_list_models",
+        lambda api_key: _models_payload(
+            "gemini-2.5-flash-image",
+            "gemini-2.5-flash-preview-tts",
+            "gemini-flash-lite-latest",
+            "gemini-3.1-flash-lite",
+            "gemini-omni-flash-preview",
+            "gemini-2.5-flash",
+        ),
+    )
+
+    assert client._candidate_models("key-1") == ["gemini-2.5-flash"]
+
+
+def test_model_discovery_caps_the_candidate_list(monkeypatch):
+    client = make_client(model=None)
+    monkeypatch.setattr(
+        client,
+        "_list_models",
+        lambda api_key: _models_payload(*[f"gemini-3.{i}-flash" for i in range(9)]),
+    )
+
+    assert len(client._candidate_models("key-1")) == GeminiClient._MAX_CANDIDATE_MODELS
+
+
+def test_model_discovery_falls_back_to_constants_on_failure(monkeypatch):
     client = make_client(model=None)
 
     def raise_error(api_key):
@@ -167,7 +211,210 @@ def test_model_discovery_falls_back_to_constant_on_failure(monkeypatch):
 
     monkeypatch.setattr(client, "_list_models", raise_error)
 
-    assert client._resolve_model("key-1") == GeminiClient._FALLBACK_MODEL
+    assert client._candidate_models("key-1") == list(GeminiClient._FALLBACK_MODELS)
+
+
+def test_pinned_model_is_the_only_candidate():
+    assert make_client(model="pinned")._candidate_models("key-1") == ["pinned"]
+
+
+# ---------------------------------------------------------------------------
+# Model-level failures (the 2026-09 outage: gemini-flash-latest answering
+# 503 "high demand" tripped every key's circuit within one request, so every
+# request for the next minute declined instantly).
+# ---------------------------------------------------------------------------
+
+
+def _discovering_client(monkeypatch, api_keys=("key-1",), models=("m1", "m2")):
+    client = make_client(model=None, api_keys=list(api_keys))
+    monkeypatch.setattr(client, "_discover_models", lambda api_key: list(models))
+    return client
+
+
+def test_overloaded_model_falls_back_to_next_model_with_same_key(monkeypatch):
+    client = _discovering_client(monkeypatch)
+    calls = []
+
+    def fake_post(key, model, prompt):
+        calls.append((key, model))
+        if model == "m1":
+            raise _ModelUnavailableError("m1: HTTP 503")
+        return "Drafted by m2."
+
+    monkeypatch.setattr(client, "_post", fake_post)
+
+    assert client.draft_description(make_request()) == "Drafted by m2."
+    assert calls == [("key-1", "m1"), ("key-1", "m2")]
+    assert client._key_states["key-1"].open_until is None
+
+
+def test_overloaded_model_is_skipped_on_the_next_request(monkeypatch):
+    client = _discovering_client(monkeypatch)
+    calls = []
+
+    def fake_post(key, model, prompt):
+        calls.append(model)
+        if model == "m1":
+            raise _ModelUnavailableError("m1: HTTP 503")
+        return "Drafted by m2."
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    client.draft_description(make_request())
+    calls.clear()
+
+    client.draft_description(make_request())
+
+    assert calls == ["m2"]
+
+
+def test_every_model_overloaded_declines_without_locking_any_key(monkeypatch):
+    client = _discovering_client(monkeypatch, api_keys=("k1", "k2", "k3", "k4"))
+
+    def overloaded(key, model, prompt):
+        raise _ModelUnavailableError(f"{model}: HTTP 503")
+
+    monkeypatch.setattr(client, "_post", overloaded)
+
+    assert client.draft_description(make_request()) is None
+    assert all(s.open_until is None for s in client._key_states.values())
+
+
+def test_model_recovers_after_its_cooldown(monkeypatch):
+    client = _discovering_client(monkeypatch, models=("m1",))
+    now = [1000.0]
+    monkeypatch.setattr("gemini_client.time.monotonic", lambda: now[0])
+    responses = iter([_ModelUnavailableError("m1: HTTP 503"), "Recovered."])
+
+    def fake_post(key, model, prompt):
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    assert client.draft_description(make_request()) is None
+
+    now[0] += GeminiClient._MODEL_COOLDOWN_S + 1
+
+    assert client.draft_description(make_request()) == "Recovered."
+
+
+def test_incomplete_response_does_not_count_against_the_key(monkeypatch):
+    """The key worked; the model's answer was the problem."""
+    client = make_client()
+    monkeypatch.setattr(client, "_post", lambda key, model, prompt: "It returns the")
+
+    client.draft_description(make_request())
+    client.draft_description(make_request())
+
+    assert client._key_states["key-1"].open_until is None
+
+
+def test_attempts_per_request_are_capped(monkeypatch):
+    client = _discovering_client(
+        monkeypatch, api_keys=[f"k{i}" for i in range(5)], models=("m1", "m2")
+    )
+    calls = []
+
+    def flaky(key, model, prompt):
+        calls.append(key)
+        raise ConnectionError("timeout")
+
+    monkeypatch.setattr(client, "_post", flaky)
+
+    assert client.draft_description(make_request()) is None
+    assert len(calls) == GeminiClient._MAX_ATTEMPTS_PER_REQUEST
+
+
+# ---------------------------------------------------------------------------
+# HTTP layer: status classification and key handling
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def _capture_post(monkeypatch, response):
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured.update(url=url, headers=headers or {})
+        return response
+
+    monkeypatch.setattr("gemini_client.requests.post", fake_post)
+    return captured
+
+
+def test_api_key_is_sent_in_a_header_never_in_the_url(monkeypatch):
+    """A key in the query string ends up in every exception message and log
+    line that mentions the URL."""
+    payload = {"candidates": [{"content": {"parts": [{"text": "Done."}]}}]}
+    captured = _capture_post(monkeypatch, _FakeResponse(200, payload))
+
+    make_client()._post("secret-key", "fake-model", "prompt")
+
+    assert "secret-key" not in captured["url"]
+    assert captured["headers"]["x-goog-api-key"] == "secret-key"
+
+
+def test_model_listing_sends_key_in_a_header(monkeypatch):
+    captured = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        captured.update(url=url, headers=headers or {})
+        return _FakeResponse(200, {"models": []})
+
+    monkeypatch.setattr("gemini_client.requests.get", fake_get)
+
+    make_client()._list_models("secret-key")
+
+    assert "secret-key" not in captured["url"]
+    assert captured["headers"]["x-goog-api-key"] == "secret-key"
+
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+def test_key_rejections_raise_key_unavailable(monkeypatch, status):
+    _capture_post(monkeypatch, _FakeResponse(status))
+
+    with pytest.raises(_KeyUnavailableError):
+        make_client()._post("key-1", "fake-model", "prompt")
+
+
+@pytest.mark.parametrize("status", [400, 404, 500, 503, 504])
+def test_model_failures_raise_model_unavailable(monkeypatch, status):
+    _capture_post(
+        monkeypatch,
+        _FakeResponse(status, {"error": {"message": "This model is overloaded."}}),
+    )
+
+    with pytest.raises(_ModelUnavailableError, match="overloaded"):
+        make_client()._post("key-1", "fake-model", "prompt")
+
+
+@pytest.mark.parametrize("status", [401, 429])
+def test_key_rejection_opens_only_that_keys_circuit(monkeypatch, status):
+    client = make_client(api_keys=["key-1", "key-2"])
+
+    def fake_post(key, model, prompt):
+        if key == "key-1":
+            raise _KeyUnavailableError(f"HTTP {status}")
+        return "Drafted by key-2."
+
+    monkeypatch.setattr(client, "_post", fake_post)
+
+    assert client.draft_description(make_request()) == "Drafted by key-2."
+    assert client._key_states["key-1"].open_until is not None
+    assert client._key_states["key-2"].open_until is None
 
 
 def test_draft_request_from_dict_builds_parameters():

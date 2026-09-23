@@ -7,8 +7,8 @@ client talks to this service instead of Gemini directly when it has no local
 keys of its own.
 
 Standalone project: does not depend on the `pycodecommenter` package. It
-owns its own Gemini-calling logic (multi-key failover, circuit breaker, live
-model discovery) in [gemini_client.py](gemini_client.py) rather than
+owns its own Gemini-calling logic (multi-key failover, per-key circuit breaker,
+per-model fallback, live model discovery) in [gemini_client.py](gemini_client.py) rather than
 importing it — see that module's docstring for why.
 
 ## Contract
@@ -57,7 +57,7 @@ gunicorn "app:create_app()"
 | `GEMINI_API_KEYS` | *(required)* | Comma-separated Gemini API key(s). |
 | `RATE_LIMIT` | `10 per minute` | Per-IP request limit (Flask-Limiter syntax). |
 | `MAX_DAILY_CALLS` | `200` | Global daily cap across all callers, in-memory (resets on redeploy). |
-| `GEMINI_MODEL` | *(auto-discovered)* | Pin a specific model instead of discovering the best available one. |
+| `GEMINI_MODEL` | *(auto-discovered)* | Pin a specific model instead of discovering the best available ones. A pinned model has no fallback if it is overloaded. |
 | `REQUEST_TIMEOUT_S` | `15` | Per-request timeout to the Gemini API. |
 
 ## Abuse/cost posture

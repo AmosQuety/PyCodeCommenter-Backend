@@ -10,11 +10,21 @@ than imported because the backend intentionally does not depend on the
 `pycodecommenter` package for its AI logic -- PyCodeCommenter itself carries
 none of this.
 
-Fails closed at every layer: a quota-exceeded key, a network error, a
-malformed/empty response, or every key being exhausted all resolve to
-:meth:`GeminiClient.draft_description` returning ``None`` -- never a partial
-or fabricated answer, never a raised exception escaping to the route
-handler under an expected failure mode.
+Fails closed at every layer: a rejected key, an unavailable model, a network
+error, a malformed/empty response, or every key and model being exhausted
+all resolve to :meth:`GeminiClient.draft_description` returning ``None`` --
+never a partial or fabricated answer, never a raised exception escaping to
+the route handler under an expected failure mode.
+
+Key failures and model failures are kept apart. A 429/401/403 is about the
+key and rests only that key; a 503 "high demand" (or other model-side error)
+is about the model and rests only that model, for every key. Treating an
+overloaded model as a key failure once locked out all four production keys
+within a single request, turning a transient Gemini overload into a
+minute-long outage of the whole service.
+
+The API key travels in the ``x-goog-api-key`` header, never in the URL, so
+it can't leak into exception messages or logs that print the URL.
 """
 
 from __future__ import annotations
@@ -22,7 +32,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -50,8 +60,15 @@ class DraftRequest:
     source: str = ""
 
 
-class _QuotaExceededError(Exception):
-    """Raised internally when a key's request comes back HTTP 429."""
+class _KeyUnavailableError(Exception):
+    """The key itself was refused: quota exhausted (429) or rejected
+    (401/403). Other keys may still work; this one should rest."""
+
+
+class _ModelUnavailableError(Exception):
+    """The model couldn't serve the request: overloaded, retired, or
+    rejecting the request's configuration. Another model may work with the
+    same key, so this never counts against the key."""
 
 
 @dataclass
@@ -76,10 +93,32 @@ class GeminiClient:
     _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
     _FAILURE_THRESHOLD = 2
     _COOLDOWN_S = 60.0
+    _MODEL_COOLDOWN_S = 60.0
     _MAX_OUTPUT_TOKENS = 200
 
-    _FALLBACK_MODEL = "gemini-flash-latest"
-    _STABLE_ALIAS_PREFERENCE = ("gemini-flash-latest", "gemini-pro-latest")
+    # Bounds one request's worst case well inside gunicorn's 120s worker
+    # timeout (each attempt is capped by `timeout_s`, 15s by default).
+    _MAX_ATTEMPTS_PER_REQUEST = 6
+    _MAX_CANDIDATE_MODELS = 3
+
+    _KEY_REJECTED_STATUSES = frozenset({401, 403, 429})
+    _MODEL_UNAVAILABLE_STATUSES = frozenset({400, 404, 500, 503, 504})
+
+    _PREFERRED_MODELS = ("gemini-flash-latest", "gemini-2.5-flash")
+    _FALLBACK_MODELS = ("gemini-flash-latest", "gemini-2.5-flash")
+    # Variants that can't serve a plain text request with thinking disabled:
+    # image/audio output models, lite models (observed rejecting
+    # thinkingBudget=0 with HTTP 400), and unstable previews.
+    _EXCLUDED_VARIANTS = (
+        "image",
+        "tts",
+        "audio",
+        "live",
+        "lite",
+        "omni",
+        "preview",
+        "exp",
+    )
     _MODEL_DISCOVERY_CACHE_TTL_S = 300.0
 
     def __init__(
@@ -96,63 +135,89 @@ class GeminiClient:
         self._key_states: Dict[str, _KeyCircuitState] = {
             key: _KeyCircuitState() for key in self.api_keys
         }
-        self._model_cache: Dict[str, tuple] = {}
+        self._model_cache: Dict[str, Tuple[List[str], float]] = {}
+        self._model_cooldown_until: Dict[str, float] = {}
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def draft_description(self, request: DraftRequest) -> Optional[str]:
         """Attempts to draft a description, failing closed to ``None``.
 
-        Tries each configured key in order, skipping any whose circuit is
-        currently open. Within one key: a 429 opens that key's circuit and
-        moves on immediately; any other failure (network error, timeout,
-        malformed/empty response) is retried once before moving on.
+        Tries each key in order and, within a key, each candidate model,
+        skipping any key whose circuit is open and any model cooling down.
+        A transient failure (network error, empty or cut-off reply) is
+        retried once on the same key and model. The total number of
+        attempts is capped by ``_MAX_ATTEMPTS_PER_REQUEST``.
 
         Args:
             request (DraftRequest): The function's facts to draft from.
 
         Returns:
             Optional[str]: The drafted, trimmed text, or ``None`` if every
-                key was exhausted or skipped.
+                key and model was exhausted, skipped, or out of attempts.
         """
         prompt = self._build_prompt(request)
+        attempts_left = self._MAX_ATTEMPTS_PER_REQUEST
 
         for key in self.api_keys:
-            state = self._key_states[key]
-            if self._is_circuit_open(state):
+            if self._is_circuit_open(self._key_states[key]):
                 continue
-
-            for attempt in range(2):
-                try:
-                    text = self._post(key, prompt)
-                except _QuotaExceededError:
-                    self._open_circuit(state)
-                    break
-                except Exception as e:
-                    logger.warning(
-                        f"Gemini request failed for {request.name} "
-                        f"(attempt {attempt + 1}/2): {e}"
-                    )
-                    self._record_failure(state)
-                    continue
-
-                if text and self._looks_complete(text):
-                    self._record_success(state)
-                    return text.strip()
-
-                # An empty response and a response that stops mid-sentence
-                # are the same failure mode from the caller's perspective:
-                # neither is a trustworthy finished fact (observed live --
-                # the model can return finishReason STOP well under the
-                # token budget but still cut off mid-thought). Both are
-                # treated as a failed attempt, never served as-is.
-                logger.warning(
-                    f"Gemini returned an empty or incomplete response for "
-                    f"{request.name}"
-                )
-                self._record_failure(state)
+            for model in self._candidate_models(key):
+                for _ in range(2):
+                    if attempts_left == 0 or not self._is_usable(key, model):
+                        break
+                    attempts_left -= 1
+                    text, retry = self._attempt(key, model, prompt, request.name)
+                    if text is not None:
+                        return text
+                    if not retry:
+                        break
 
         return None
+
+    def _attempt(
+        self, key: str, model: str, prompt: str, name: str
+    ) -> Tuple[Optional[str], bool]:
+        """Makes one call and records its outcome against the key or model.
+
+        Args:
+            key (str): The API key to use.
+            model (str): The model to call.
+            prompt (str): The built prompt.
+            name (str): The function name, for logging only.
+
+        Returns:
+            Tuple[Optional[str], bool]: The accepted text (or ``None``), and
+                whether the same key and model are worth one more try.
+        """
+        state = self._key_states[key]
+        try:
+            text = self._post(key, model, prompt)
+        except _KeyUnavailableError as e:
+            logger.warning(f"Gemini key rejected while drafting {name}: {e}")
+            self._open_circuit(state)
+            return None, False
+        except _ModelUnavailableError as e:
+            logger.warning(f"Gemini model unavailable while drafting {name}: {e}")
+            self._model_cooldown_until[model] = (
+                time.monotonic() + self._MODEL_COOLDOWN_S
+            )
+            return None, False
+        except Exception as e:
+            logger.warning(f"Gemini request failed for {name} on {model}: {e}")
+            self._record_failure(state)
+            return None, True
+
+        if text and self._looks_complete(text):
+            self._record_success(state)
+            return text.strip(), False
+
+        # An empty reply and one that stops mid-sentence are the same
+        # failure (observed live: finishReason STOP well under the token
+        # budget, cut off mid-thought) -- never served as a finished fact.
+        # The key worked, so this doesn't count against it.
+        logger.warning(f"Gemini returned an empty or incomplete response for {name}")
+        return None, True
 
     @staticmethod
     def _looks_complete(text: str) -> bool:
@@ -167,10 +232,15 @@ class GeminiClient:
             bool: ``True`` if the trimmed text ends with ``.``, ``!``, or
                 ``?`` (allowing one trailing closing quote/bracket).
         """
-        stripped = text.strip().rstrip("\"')]”’")
+        stripped = text.strip().rstrip("\"')]\u201d\u2019")
         return stripped.endswith((".", "!", "?"))
 
-    # ── Circuit breaker ──────────────────────────────────────────────────
+    # ── Circuit breaker and model cooldown ───────────────────────────────
+
+    def _is_usable(self, key: str, model: str) -> bool:
+        cooling_until = self._model_cooldown_until.get(model)
+        model_cooling = cooling_until is not None and time.monotonic() < cooling_until
+        return not model_cooling and not self._is_circuit_open(self._key_states[key])
 
     def _is_circuit_open(self, state: _KeyCircuitState) -> bool:
         return state.open_until is not None and time.monotonic() < state.open_until
@@ -221,94 +291,116 @@ class GeminiClient:
 
     # ── Model discovery ──────────────────────────────────────────────────
 
-    def _resolve_model(self, api_key: str) -> str:
+    def _candidate_models(self, api_key: str) -> List[str]:
+        """The models to try for this key, best first.
+
+        Args:
+            api_key (str): The key whose visible models to use.
+
+        Returns:
+            List[str]: The pinned model alone if one is configured,
+                otherwise the discovered candidates (cached per key).
+        """
         if self.model is not None:
-            return self.model
+            return [self.model]
 
         cached = self._model_cache.get(api_key)
         if cached is not None and time.monotonic() < cached[1]:
             return cached[0]
 
-        discovered = self._discover_model(api_key)
+        models = self._discover_models(api_key)
         self._model_cache[api_key] = (
-            discovered,
+            models,
             time.monotonic() + self._MODEL_DISCOVERY_CACHE_TTL_S,
         )
-        return discovered
+        return models
 
-    def _discover_model(self, api_key: str) -> str:
+    def _discover_models(self, api_key: str) -> List[str]:
+        """Ranks the text-capable Flash models this key can call.
+
+        Preferred models come first in their fixed order, then other stable
+        Flash models alphabetically, capped at ``_MAX_CANDIDATE_MODELS``.
+        Model names churn, so this asks the API rather than trusting a
+        hardcoded list -- which is only the fallback when discovery fails.
+
+        Args:
+            api_key (str): The key to list models with.
+
+        Returns:
+            List[str]: Candidate model names, best first; never empty.
+        """
         try:
             payload = self._list_models(api_key)
         except Exception as e:
-            logger.warning(
-                f"Gemini model discovery failed, falling back to "
-                f"{self._FALLBACK_MODEL}: {e}"
-            )
-            return self._FALLBACK_MODEL
+            logger.warning(f"Gemini model discovery failed, using fallbacks: {e}")
+            return list(self._FALLBACK_MODELS)
 
         available = {
             model.get("name", "").split("/")[-1]
             for model in payload.get("models") or []
             if "generateContent" in (model.get("supportedGenerationMethods") or [])
         }
-
-        for preferred in self._STABLE_ALIAS_PREFERENCE:
-            if preferred in available:
-                return preferred
-
-        stable_flash = sorted(
+        usable = {
             name
             for name in available
             if "flash" in name.lower()
-            and "preview" not in name.lower()
-            and "exp" not in name.lower()
-        )
-        if stable_flash:
-            return stable_flash[0]
-
-        any_flash = sorted(name for name in available if "flash" in name.lower())
-        if any_flash:
-            return any_flash[0]
-
-        return self._FALLBACK_MODEL
+            and not any(v in name.lower() for v in self._EXCLUDED_VARIANTS)
+        }
+        preferred = [m for m in self._PREFERRED_MODELS if m in usable]
+        others = sorted(usable - set(preferred))
+        candidates = (preferred + others)[: self._MAX_CANDIDATE_MODELS]
+        return candidates or list(self._FALLBACK_MODELS)
 
     def _list_models(self, api_key: str) -> dict:
         """Isolated (like `_post`) so tests can monkeypatch this one method
         instead of the network layer."""
-        url = f"{self._BASE_URL}/models?key={api_key}"
-        response = requests.get(url, timeout=self.timeout_s)
+        response = requests.get(
+            f"{self._BASE_URL}/models",
+            headers=self._auth_headers(api_key),
+            timeout=self.timeout_s,
+        )
         response.raise_for_status()
         return response.json()
 
     # ── HTTP ─────────────────────────────────────────────────────────────
 
-    def _post(self, api_key: str, prompt: str) -> str:
+    @staticmethod
+    def _auth_headers(api_key: str) -> Dict[str, str]:
+        return {"x-goog-api-key": api_key}
+
+    def _post(self, api_key: str, model: str, prompt: str) -> str:
         """Isolated so tests can monkeypatch this one method instead of the
         network layer.
 
         Raises:
-            _QuotaExceededError: The API responded with HTTP 429.
+            _KeyUnavailableError: The key was refused (401, 403, 429).
+            _ModelUnavailableError: The model couldn't serve the request
+                (400, 404, 500, 503, 504).
             Exception: Any other network, HTTP, or parsing failure.
         """
-        model = self._resolve_model(api_key)
-        url = f"{self._BASE_URL}/models/{model}:generateContent?key={api_key}"
+        url = f"{self._BASE_URL}/models/{model}:generateContent"
         body = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.2,
                 "maxOutputTokens": self._MAX_OUTPUT_TOKENS,
-                # See module docstring: several current Gemini models spend
-                # their whole output budget on invisible reasoning unless
-                # this is disabled. A one-sentence grounded description
-                # needs no extended reasoning; this also roughly quarters
-                # real token usage per call.
+                # Several current Gemini models spend their whole output
+                # budget on invisible reasoning unless this is disabled. A
+                # one-sentence grounded description needs no extended
+                # reasoning; this also roughly quarters real token usage.
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
 
-        response = requests.post(url, json=body, timeout=self.timeout_s)
-        if response.status_code == 429:
-            raise _QuotaExceededError(response.text)
+        response = requests.post(
+            url, json=body, headers=self._auth_headers(api_key), timeout=self.timeout_s
+        )
+        if response.status_code in self._KEY_REJECTED_STATUSES:
+            raise _KeyUnavailableError(f"HTTP {response.status_code}")
+        if response.status_code in self._MODEL_UNAVAILABLE_STATUSES:
+            raise _ModelUnavailableError(
+                f"{model}: HTTP {response.status_code} {_error_message(response)}"
+            )
         response.raise_for_status()
         payload = response.json()
 
@@ -317,6 +409,15 @@ class GeminiClient:
             raise ValueError("Gemini returned no candidates")
         parts = candidates[0].get("content", {}).get("parts") or []
         return parts[0].get("text", "") if parts else ""
+
+
+def _error_message(response: requests.Response) -> str:
+    """Gemini's own error message from a failed response, shortened for
+    logging; empty if the body isn't the usual JSON error shape."""
+    try:
+        return str(response.json().get("error", {}).get("message", ""))[:200]
+    except Exception:
+        return ""
 
 
 def draft_request_from_dict(data: dict) -> DraftRequest:

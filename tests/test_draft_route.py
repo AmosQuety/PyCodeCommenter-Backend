@@ -35,7 +35,9 @@ def test_health_check_is_never_rate_limited(fake_config):
 def test_draft_description_success(client, app, valid_payload, monkeypatch):
     gemini_client: GeminiClient = app.config["GEMINI_CLIENT"]
     monkeypatch.setattr(
-        gemini_client, "_post", lambda key, prompt: "Calculates the discounted price."
+        gemini_client,
+        "_post",
+        lambda key, model, prompt: "Calculates the discounted price.",
     )
 
     response = client.post("/v1/draft-description", json=valid_payload)
@@ -48,7 +50,7 @@ def test_draft_description_decline_is_200_with_null(
     client, app, valid_payload, monkeypatch
 ):
     gemini_client: GeminiClient = app.config["GEMINI_CLIENT"]
-    monkeypatch.setattr(gemini_client, "_post", lambda key, prompt: "")
+    monkeypatch.setattr(gemini_client, "_post", lambda key, model, prompt: "")
 
     response = client.post("/v1/draft-description", json=valid_payload)
 
@@ -76,7 +78,9 @@ def test_draft_description_minimal_payload_defaults_missing_fields(
     client, app, monkeypatch
 ):
     gemini_client: GeminiClient = app.config["GEMINI_CLIENT"]
-    monkeypatch.setattr(gemini_client, "_post", lambda key, prompt: "A function.")
+    monkeypatch.setattr(
+        gemini_client, "_post", lambda key, model, prompt: "A function."
+    )
 
     response = client.post("/v1/draft-description", json={"name": "f"})
 
@@ -111,7 +115,7 @@ def test_rate_limit_returns_429_with_json_body(fake_config, valid_payload):
     app = create_app(config=strict_config)
     app.config["TESTING"] = True
     client = app.test_client()
-    app.config["GEMINI_CLIENT"]._post = lambda key, prompt: "ok"
+    app.config["GEMINI_CLIENT"]._post = lambda key, model, prompt: "ok"
 
     first = client.post("/v1/draft-description", json=valid_payload)
     second = client.post("/v1/draft-description", json=valid_payload)
