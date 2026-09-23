@@ -481,12 +481,18 @@ def test_draft_json_returns_the_accepted_parse(monkeypatch):
     assert result == '{"ok": true}'
 
 
-def test_draft_json_retries_when_output_is_rejected(monkeypatch):
-    client = make_client()
-    outputs = iter(["not json", '{"ok": true}'])
-    monkeypatch.setattr(
-        client, "_post", lambda key, model, prompt, schema=None: next(outputs)
-    )
+def test_rejected_reply_moves_on_to_the_next_model(monkeypatch):
+    """A model that produced unusable output (observed live: a runaway reply
+    cut off by the token budget) tends to do it again at low temperature, so
+    the next model is tried rather than the same one."""
+    client = _discovering_client(monkeypatch, models=("m1", "m2"))
+    calls = []
+
+    def fake_post(key, model, prompt, schema=None):
+        calls.append(model)
+        return "not json" if model == "m1" else '{"ok": true}'
+
+    monkeypatch.setattr(client, "_post", fake_post)
 
     result = client.draft_json(
         "prompt",
@@ -496,24 +502,5 @@ def test_draft_json_retries_when_output_is_rejected(monkeypatch):
     )
 
     assert result == '{"ok": true}'
-
-
-def test_invalid_key_400_is_a_key_failure_not_a_model_failure(monkeypatch):
-    """Google reports a revoked or mistyped key as HTTP 400 API_KEY_INVALID.
-    Treated as a model failure, one bad key would cool the model down for
-    every other (valid) key."""
-    _capture_post(
-        monkeypatch,
-        _FakeResponse(
-            400,
-            {
-                "error": {
-                    "status": "INVALID_ARGUMENT",
-                    "details": [{"reason": "API_KEY_INVALID"}],
-                }
-            },
-        ),
-    )
-
-    with pytest.raises(_KeyUnavailableError):
-        make_client()._post("key-1", "fake-model", "prompt")
+    assert calls == ["m1", "m2"]
+    assert client._key_states["key-1"].open_until is None

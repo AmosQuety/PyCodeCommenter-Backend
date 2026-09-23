@@ -200,9 +200,9 @@ class GeminiClient:
         """Tries each key in order and, within a key, each candidate model,
         skipping any key whose circuit is open and any model cooling down.
 
-        A transient failure (network error, rejected reply) is retried once
-        on the same key and model. The total number of attempts is capped
-        by ``_MAX_ATTEMPTS_PER_REQUEST``.
+        A network failure is retried once on the same key and model; an
+        unusable reply moves on to the next model. The total number of
+        attempts is capped by ``_MAX_ATTEMPTS_PER_REQUEST``.
 
         Args:
             job (_DraftJob): What to ask for and how to judge the reply.
@@ -264,9 +264,12 @@ class GeminiClient:
             self._record_success(state)
             return result, False
 
-        # The key worked, so a rejected reply doesn't count against it.
+        # The key worked, so a rejected reply doesn't count against it. The
+        # model tends to repeat the failure at low temperature (observed
+        # live: a runaway reply cut off by the token budget), so the next
+        # model is tried rather than the same one.
         logger.warning(f"Gemini returned an unusable response for {job.name}")
-        return None, True
+        return None, False
 
     @classmethod
     def _accept_sentence(cls, text: str) -> Optional[str]:

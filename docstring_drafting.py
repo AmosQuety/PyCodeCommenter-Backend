@@ -197,30 +197,61 @@ def _requested_text(slots: DocstringSlots) -> str:
 def response_schema(request: DocstringDraftRequest) -> dict:
     """The JSON schema for the reply, covering exactly the requested slots.
 
+    Every text field carries a length cap and a one-line description:
+    without them, gemini-2.5-flash in JSON mode was observed rambling in a
+    single field until the output budget cut the JSON off mid-string.
+
     Args:
         request (DocstringDraftRequest): The validated request.
 
     Returns:
         dict: A Gemini ``responseSchema`` (OpenAPI subset).
     """
-    text = {"type": "STRING", "nullable": True}
     slots = request.slots
-    properties: Dict[str, Any] = {
-        name: text
-        for name in ("summary", "description", "returns")
-        if getattr(slots, name)
-    }
+    properties: Dict[str, Any] = {}
+    if slots.summary:
+        properties["summary"] = _text_field(
+            MAX_SUMMARY_CHARS, "Imperative phrase saying what the function does."
+        )
+    if slots.description:
+        properties["description"] = _text_field(
+            MAX_SLOT_CHARS, "One sentence of detail beyond the summary, or null."
+        )
     if slots.params:
-        properties["params"] = {
-            "type": "OBJECT",
-            "properties": {name: text for name in slots.params},
-        }
+        properties["params"] = _named_fields(
+            slots.params, "One sentence: what this argument is for."
+        )
+    if slots.returns:
+        properties["returns"] = _text_field(
+            MAX_SLOT_CHARS, "One sentence: what the returned value represents."
+        )
     if slots.raises:
-        properties["raises"] = {
-            "type": "OBJECT",
-            "properties": {name: text for name in slots.raises},
-        }
-    return {"type": "OBJECT", "properties": properties}
+        properties["raises"] = _named_fields(
+            slots.raises, "One sentence: when this exception is raised."
+        )
+    return {
+        "type": "OBJECT",
+        "properties": properties,
+        "propertyOrdering": list(properties),
+    }
+
+
+def _text_field(max_chars: int, description: str) -> dict:
+    return {
+        "type": "STRING",
+        "nullable": True,
+        "maxLength": max_chars,
+        "description": description,
+    }
+
+
+def _named_fields(names: List[str], description: str) -> dict:
+    return {
+        "type": "OBJECT",
+        "properties": {
+            name: _text_field(MAX_SLOT_CHARS, description) for name in names
+        },
+    }
 
 
 def parse_docstring_draft(raw: str, request: DocstringDraftRequest) -> Dict[str, Any]:

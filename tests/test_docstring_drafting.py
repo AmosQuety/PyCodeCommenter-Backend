@@ -178,3 +178,17 @@ def test_malformed_model_output_declines_everything(raw):
         "returns": None,
         "raises": {},
     }
+
+
+def test_schema_caps_every_text_field_and_asks_for_the_summary_first():
+    """Observed live: without a length cap, gemini-2.5-flash in JSON mode can
+    ramble in one field until the output budget cuts the JSON off."""
+    schema = response_schema(docstring_request_from_dict(make_payload()))
+    props = schema["properties"]
+
+    assert props["summary"]["maxLength"] == 80
+    assert props["returns"]["maxLength"] == 300
+    assert props["params"]["properties"]["discount"]["maxLength"] == 300
+    assert props["raises"]["properties"]["ValueError"]["maxLength"] == 300
+    assert schema["propertyOrdering"][0] == "summary"
+    assert all(props[name].get("description") for name in ("summary", "returns"))
