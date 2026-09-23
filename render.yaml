@@ -13,3 +13,7 @@ services:
         value: "10 per minute"
       - key: MAX_DAILY_CALLS
         value: "200"
+      - key: MAX_DAILY_CALLS_PER_USER
+        value: "25"
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"

@@ -57,6 +57,8 @@ gunicorn "app:create_app()"
 | `GEMINI_API_KEYS` | *(required)* | Comma-separated Gemini API key(s). |
 | `RATE_LIMIT` | `10 per minute` | Per-IP request limit (Flask-Limiter syntax). |
 | `MAX_DAILY_CALLS` | `200` | Global daily cap across all callers, in-memory (resets on redeploy). |
+| `MAX_DAILY_CALLS_PER_USER` | `25` | Daily drafts per caller (by IP address), in-memory (resets on redeploy). |
+| `TRUSTED_PROXY_HOPS` | `1` | Proxies whose `X-Forwarded-For` entry is trusted to identify the caller. Render's load balancer is one. Too high lets callers spoof their address; too low makes every caller look like the proxy. |
 | `GEMINI_MODEL` | *(auto-discovered)* | Pin a specific model instead of discovering the best available ones. A pinned model has no fallback if it is overloaded. |
 | `REQUEST_TIMEOUT_S` | `15` | Per-request timeout to the Gemini API. |
 
@@ -64,7 +66,7 @@ gunicorn "app:create_app()"
 
 There is no real authentication on this endpoint — anyone can read the
 client's source and call it directly. The mitigations (per-IP rate limiting,
-a global daily cap, zero cost exposure since Gemini's free tier is $0) bound
+a per-caller daily allowance, a global daily cap, zero cost exposure since Gemini's free tier is $0) bound
 *nuisance*, not a security boundary. See the PyCodeCommenter project's
 `Future Work/AI Backend Implementation Plan.md`, section 6.6, for the full
 reasoning.

@@ -38,7 +38,9 @@ def test_requires_at_least_one_key():
 
 def test_successful_draft_returns_trimmed_text(monkeypatch):
     client = make_client()
-    monkeypatch.setattr(client, "_post", lambda key, model, prompt: "  A function.  ")
+    monkeypatch.setattr(
+        client, "_post", lambda key, model, prompt, schema=None: "  A function.  "
+    )
 
     result = client.draft_description(make_request())
 
@@ -47,7 +49,7 @@ def test_successful_draft_returns_trimmed_text(monkeypatch):
 
 def test_empty_response_is_treated_as_decline(monkeypatch):
     client = make_client()
-    monkeypatch.setattr(client, "_post", lambda key, model, prompt: "")
+    monkeypatch.setattr(client, "_post", lambda key, model, prompt, schema=None: "")
 
     assert client.draft_description(make_request()) is None
 
@@ -60,7 +62,9 @@ def test_mid_sentence_cutoff_is_never_served_as_a_finished_fact(monkeypatch):
     monkeypatch.setattr(
         client,
         "_post",
-        lambda key, model, prompt: "This function determines whether it is at",
+        lambda key, model, prompt, schema=None: (
+            "This function determines whether it is at"
+        ),
     )
 
     assert client.draft_description(make_request()) is None
@@ -69,7 +73,9 @@ def test_mid_sentence_cutoff_is_never_served_as_a_finished_fact(monkeypatch):
 def test_complete_sentence_ending_in_a_quote_is_accepted(monkeypatch):
     client = make_client()
     monkeypatch.setattr(
-        client, "_post", lambda key, model, prompt: 'It returns the value "done."'
+        client,
+        "_post",
+        lambda key, model, prompt, schema=None: 'It returns the value "done."',
     )
 
     assert client.draft_description(make_request()) == 'It returns the value "done."'
@@ -78,7 +84,7 @@ def test_complete_sentence_ending_in_a_quote_is_accepted(monkeypatch):
 def test_all_keys_exhausted_returns_none(monkeypatch):
     client = make_client(api_keys=["key-1", "key-2"])
 
-    def always_fail(key, model, prompt):
+    def always_fail(key, model, prompt, schema=None):
         raise ConnectionError("boom")
 
     monkeypatch.setattr(client, "_post", always_fail)
@@ -90,7 +96,7 @@ def test_429_opens_circuit_and_skips_key_on_next_call(monkeypatch):
     client = make_client(api_keys=["key-1", "key-2"])
     calls = []
 
-    def fake_post(key, model, prompt):
+    def fake_post(key, model, prompt, schema=None):
         calls.append(key)
         if key == "key-1":
             from gemini_client import _KeyUnavailableError
@@ -114,7 +120,7 @@ def test_non_quota_failure_retries_once_before_moving_to_next_key(monkeypatch):
     client = make_client(api_keys=["key-1", "key-2"])
     attempts = {"key-1": 0}
 
-    def fake_post(key, model, prompt):
+    def fake_post(key, model, prompt, schema=None):
         if key == "key-1":
             attempts["key-1"] += 1
             raise ConnectionError("transient")
@@ -133,7 +139,9 @@ def test_two_consecutive_non_quota_failures_open_the_circuit(monkeypatch):
     monkeypatch.setattr(
         client,
         "_post",
-        lambda key, model, prompt: (_ for _ in ()).throw(ConnectionError()),
+        lambda key, model, prompt, schema=None: (_ for _ in ()).throw(
+            ConnectionError()
+        ),
     )
 
     client.draft_description(make_request())
@@ -235,7 +243,7 @@ def test_overloaded_model_falls_back_to_next_model_with_same_key(monkeypatch):
     client = _discovering_client(monkeypatch)
     calls = []
 
-    def fake_post(key, model, prompt):
+    def fake_post(key, model, prompt, schema=None):
         calls.append((key, model))
         if model == "m1":
             raise _ModelUnavailableError("m1: HTTP 503")
@@ -252,7 +260,7 @@ def test_overloaded_model_is_skipped_on_the_next_request(monkeypatch):
     client = _discovering_client(monkeypatch)
     calls = []
 
-    def fake_post(key, model, prompt):
+    def fake_post(key, model, prompt, schema=None):
         calls.append(model)
         if model == "m1":
             raise _ModelUnavailableError("m1: HTTP 503")
@@ -270,7 +278,7 @@ def test_overloaded_model_is_skipped_on_the_next_request(monkeypatch):
 def test_every_model_overloaded_declines_without_locking_any_key(monkeypatch):
     client = _discovering_client(monkeypatch, api_keys=("k1", "k2", "k3", "k4"))
 
-    def overloaded(key, model, prompt):
+    def overloaded(key, model, prompt, schema=None):
         raise _ModelUnavailableError(f"{model}: HTTP 503")
 
     monkeypatch.setattr(client, "_post", overloaded)
@@ -285,7 +293,7 @@ def test_model_recovers_after_its_cooldown(monkeypatch):
     monkeypatch.setattr("gemini_client.time.monotonic", lambda: now[0])
     responses = iter([_ModelUnavailableError("m1: HTTP 503"), "Recovered."])
 
-    def fake_post(key, model, prompt):
+    def fake_post(key, model, prompt, schema=None):
         result = next(responses)
         if isinstance(result, Exception):
             raise result
@@ -302,7 +310,9 @@ def test_model_recovers_after_its_cooldown(monkeypatch):
 def test_incomplete_response_does_not_count_against_the_key(monkeypatch):
     """The key worked; the model's answer was the problem."""
     client = make_client()
-    monkeypatch.setattr(client, "_post", lambda key, model, prompt: "It returns the")
+    monkeypatch.setattr(
+        client, "_post", lambda key, model, prompt, schema=None: "It returns the"
+    )
 
     client.draft_description(make_request())
     client.draft_description(make_request())
@@ -316,7 +326,7 @@ def test_attempts_per_request_are_capped(monkeypatch):
     )
     calls = []
 
-    def flaky(key, model, prompt):
+    def flaky(key, model, prompt, schema=None):
         calls.append(key)
         raise ConnectionError("timeout")
 
@@ -405,7 +415,7 @@ def test_model_failures_raise_model_unavailable(monkeypatch, status):
 def test_key_rejection_opens_only_that_keys_circuit(monkeypatch, status):
     client = make_client(api_keys=["key-1", "key-2"])
 
-    def fake_post(key, model, prompt):
+    def fake_post(key, model, prompt, schema=None):
         if key == "key-1":
             raise _KeyUnavailableError(f"HTTP {status}")
         return "Drafted by key-2."
@@ -437,3 +447,73 @@ def test_draft_request_from_dict_builds_parameters():
 def test_draft_request_from_dict_requires_name():
     with pytest.raises(KeyError):
         draft_request_from_dict({"source": "def f(): pass"})
+
+
+def test_json_mode_request_carries_schema_and_a_larger_output_budget(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["body"] = json
+        payload = {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+        return _FakeResponse(200, payload)
+
+    monkeypatch.setattr("gemini_client.requests.post", fake_post)
+    schema = {"type": "object", "properties": {}}
+
+    make_client()._post("key-1", "fake-model", "prompt", schema)
+
+    config = captured["body"]["generationConfig"]
+    assert config["responseMimeType"] == "application/json"
+    assert config["responseSchema"] == schema
+    assert config["maxOutputTokens"] > GeminiClient._MAX_OUTPUT_TOKENS
+
+
+def test_draft_json_returns_the_accepted_parse(monkeypatch):
+    client = make_client()
+    monkeypatch.setattr(
+        client, "_post", lambda key, model, prompt, schema=None: '{"ok": true}'
+    )
+
+    result = client.draft_json(
+        "prompt", {"type": "object"}, accept=lambda raw: raw, name="f"
+    )
+
+    assert result == '{"ok": true}'
+
+
+def test_draft_json_retries_when_output_is_rejected(monkeypatch):
+    client = make_client()
+    outputs = iter(["not json", '{"ok": true}'])
+    monkeypatch.setattr(
+        client, "_post", lambda key, model, prompt, schema=None: next(outputs)
+    )
+
+    result = client.draft_json(
+        "prompt",
+        {"type": "object"},
+        accept=lambda raw: raw if raw.startswith("{") else None,
+        name="f",
+    )
+
+    assert result == '{"ok": true}'
+
+
+def test_invalid_key_400_is_a_key_failure_not_a_model_failure(monkeypatch):
+    """Google reports a revoked or mistyped key as HTTP 400 API_KEY_INVALID.
+    Treated as a model failure, one bad key would cool the model down for
+    every other (valid) key."""
+    _capture_post(
+        monkeypatch,
+        _FakeResponse(
+            400,
+            {
+                "error": {
+                    "status": "INVALID_ARGUMENT",
+                    "details": [{"reason": "API_KEY_INVALID"}],
+                }
+            },
+        ),
+    )
+
+    with pytest.raises(_KeyUnavailableError):
+        make_client()._post("key-1", "fake-model", "prompt")

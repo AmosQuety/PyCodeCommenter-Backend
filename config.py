@@ -19,6 +19,12 @@ class Config:
     max_daily_calls: int
     gemini_model: Optional[str]
     request_timeout_s: float
+    # Drafts one client (by IP address) may request per UTC day.
+    max_daily_calls_per_user: int = 25
+    # Proxies in front of the app whose X-Forwarded-For entry is trusted
+    # (Render's load balancer). Too high lets callers spoof their address;
+    # too low makes every caller look like the proxy.
+    trusted_proxy_hops: int = 1
 
 
 def _parse_api_keys(raw: str) -> List[str]:
@@ -71,4 +77,6 @@ def load_config(dotenv_path: Optional[str] = None) -> Config:
         max_daily_calls=int(os.environ.get("MAX_DAILY_CALLS", "200")),
         gemini_model=os.environ.get("GEMINI_MODEL") or None,
         request_timeout_s=float(os.environ.get("REQUEST_TIMEOUT_S", "15")),
+        max_daily_calls_per_user=int(os.environ.get("MAX_DAILY_CALLS_PER_USER", "25")),
+        trusted_proxy_hops=int(os.environ.get("TRUSTED_PROXY_HOPS", "1")),
     )

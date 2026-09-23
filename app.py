@@ -9,11 +9,13 @@ from __future__ import annotations
 import logging
 
 from flask import Flask, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import load_config
 from gemini_client import GeminiClient
 from middleware.daily_cap import DailyCap
 from middleware.rate_limit import build_limiter
+from middleware.user_quota import UserDailyQuota
 from routes.draft import bp as draft_bp
 
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +42,17 @@ def create_app(config=None) -> Flask:
         timeout_s=resolved_config.request_timeout_s,
     )
     app.config["DAILY_CAP"] = DailyCap(max_calls=resolved_config.max_daily_calls)
+    app.config["USER_QUOTA"] = UserDailyQuota(
+        max_per_client=resolved_config.max_daily_calls_per_user
+    )
+
+    # Behind Render's load balancer every request arrives from the proxy's
+    # own address. ProxyFix restores the caller's address from the
+    # X-Forwarded-For entry the trusted proxy appended, so per-client
+    # limits (and flask-limiter's per-IP rate limit) apply per caller
+    # rather than to everyone at once. Entries further left are
+    # caller-supplied and ignored.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=resolved_config.trusted_proxy_hops)
 
     app.register_blueprint(draft_bp)
     build_limiter(app, default_limit=resolved_config.rate_limit)

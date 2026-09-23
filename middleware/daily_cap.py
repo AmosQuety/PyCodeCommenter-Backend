@@ -13,6 +13,19 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 
+def utc_today() -> str:
+    """Today's date in UTC, the day boundary every allowance resets on."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def seconds_until_utc_midnight() -> int:
+    """Seconds until the next UTC midnight, for a `Retry-After` header."""
+    now = datetime.now(timezone.utc)
+    midnight_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_reset = midnight_today + timedelta(days=1)
+    return max(1, int((next_reset - now).total_seconds()))
+
+
 class DailyCap:
     """Thread-safe counter that resets at UTC midnight.
 
@@ -29,7 +42,7 @@ class DailyCap:
 
     @staticmethod
     def _today() -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return utc_today()
 
     def try_consume(self) -> bool:
         """Atomically checks and increments the counter.
@@ -52,10 +65,7 @@ class DailyCap:
 
     def seconds_until_reset(self) -> int:
         """Seconds until the next UTC midnight, for a `Retry-After` header."""
-        now = datetime.now(timezone.utc)
-        midnight_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        next_reset = midnight_today + timedelta(days=1)
-        return max(1, int((next_reset - now).total_seconds()))
+        return seconds_until_utc_midnight()
 
 
-__all__ = ["DailyCap"]
+__all__ = ["DailyCap", "utc_today", "seconds_until_utc_midnight"]

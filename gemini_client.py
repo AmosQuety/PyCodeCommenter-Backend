@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -71,6 +71,25 @@ class _ModelUnavailableError(Exception):
     same key, so this never counts against the key."""
 
 
+@dataclass(frozen=True)
+class _DraftJob:
+    """One drafting request, as the retry loop sees it.
+
+    Attributes:
+        prompt (str): The built prompt.
+        name (str): The function name, for logging only.
+        accept (Callable[[str], Any]): Turns raw model text into the value to
+            return, or ``None`` to reject it (treated as a failed attempt).
+        response_schema (Optional[dict]): A JSON schema to request JSON mode
+            with, or ``None`` for plain text.
+    """
+
+    prompt: str
+    name: str
+    accept: Callable[[str], Any]
+    response_schema: Optional[dict] = None
+
+
 @dataclass
 class _KeyCircuitState:
     consecutive_failures: int = 0
@@ -95,6 +114,8 @@ class GeminiClient:
     _COOLDOWN_S = 60.0
     _MODEL_COOLDOWN_S = 60.0
     _MAX_OUTPUT_TOKENS = 200
+    # A structured draft fills several slots in one reply.
+    _MAX_JSON_OUTPUT_TOKENS = 1024
 
     # Bounds one request's worst case well inside gunicorn's 120s worker
     # timeout (each attempt is capped by `timeout_s`, 15s by default).
@@ -141,22 +162,55 @@ class GeminiClient:
     # ── Public API ────────────────────────────────────────────────────────
 
     def draft_description(self, request: DraftRequest) -> Optional[str]:
-        """Attempts to draft a description, failing closed to ``None``.
-
-        Tries each key in order and, within a key, each candidate model,
-        skipping any key whose circuit is open and any model cooling down.
-        A transient failure (network error, empty or cut-off reply) is
-        retried once on the same key and model. The total number of
-        attempts is capped by ``_MAX_ATTEMPTS_PER_REQUEST``.
+        """Drafts a one-sentence description, failing closed to ``None``.
 
         Args:
             request (DraftRequest): The function's facts to draft from.
 
         Returns:
-            Optional[str]: The drafted, trimmed text, or ``None`` if every
-                key and model was exhausted, skipped, or out of attempts.
+            Optional[str]: The drafted, trimmed sentence, or ``None``.
         """
-        prompt = self._build_prompt(request)
+        job = _DraftJob(
+            prompt=self._build_prompt(request),
+            name=request.name,
+            accept=self._accept_sentence,
+        )
+        return self._run(job)
+
+    def draft_json(
+        self, prompt: str, schema: dict, accept: Callable[[str], Any], name: str
+    ) -> Any:
+        """Drafts a structured (JSON-mode) reply, failing closed to ``None``.
+
+        Args:
+            prompt (str): The built prompt.
+            schema (dict): The JSON schema the reply must follow.
+            accept (Callable[[str], Any]): Parses and validates the raw reply,
+                returning ``None`` to reject it.
+            name (str): The function name, for logging only.
+
+        Returns:
+            Any: Whatever ``accept`` returned for the first accepted reply,
+                or ``None`` if no reply was accepted.
+        """
+        job = _DraftJob(prompt=prompt, name=name, accept=accept, response_schema=schema)
+        return self._run(job)
+
+    def _run(self, job: _DraftJob) -> Any:
+        """Tries each key in order and, within a key, each candidate model,
+        skipping any key whose circuit is open and any model cooling down.
+
+        A transient failure (network error, rejected reply) is retried once
+        on the same key and model. The total number of attempts is capped
+        by ``_MAX_ATTEMPTS_PER_REQUEST``.
+
+        Args:
+            job (_DraftJob): What to ask for and how to judge the reply.
+
+        Returns:
+            Any: The first accepted result, or ``None`` if every key and
+                model was exhausted, skipped, or out of attempts.
+        """
         attempts_left = self._MAX_ATTEMPTS_PER_REQUEST
 
         for key in self.api_keys:
@@ -167,57 +221,60 @@ class GeminiClient:
                     if attempts_left == 0 or not self._is_usable(key, model):
                         break
                     attempts_left -= 1
-                    text, retry = self._attempt(key, model, prompt, request.name)
-                    if text is not None:
-                        return text
+                    result, retry = self._attempt(key, model, job)
+                    if result is not None:
+                        return result
                     if not retry:
                         break
 
         return None
 
-    def _attempt(
-        self, key: str, model: str, prompt: str, name: str
-    ) -> Tuple[Optional[str], bool]:
+    def _attempt(self, key: str, model: str, job: _DraftJob) -> Tuple[Any, bool]:
         """Makes one call and records its outcome against the key or model.
 
         Args:
             key (str): The API key to use.
             model (str): The model to call.
-            prompt (str): The built prompt.
-            name (str): The function name, for logging only.
+            job (_DraftJob): What to ask for and how to judge the reply.
 
         Returns:
-            Tuple[Optional[str], bool]: The accepted text (or ``None``), and
-                whether the same key and model are worth one more try.
+            Tuple[Any, bool]: The accepted result (or ``None``), and whether
+                the same key and model are worth one more try.
         """
         state = self._key_states[key]
         try:
-            text = self._post(key, model, prompt)
+            text = self._post(key, model, job.prompt, job.response_schema)
         except _KeyUnavailableError as e:
-            logger.warning(f"Gemini key rejected while drafting {name}: {e}")
+            logger.warning(f"Gemini key rejected while drafting {job.name}: {e}")
             self._open_circuit(state)
             return None, False
         except _ModelUnavailableError as e:
-            logger.warning(f"Gemini model unavailable while drafting {name}: {e}")
+            logger.warning(f"Gemini model unavailable while drafting {job.name}: {e}")
             self._model_cooldown_until[model] = (
                 time.monotonic() + self._MODEL_COOLDOWN_S
             )
             return None, False
         except Exception as e:
-            logger.warning(f"Gemini request failed for {name} on {model}: {e}")
+            logger.warning(f"Gemini request failed for {job.name} on {model}: {e}")
             self._record_failure(state)
             return None, True
 
-        if text and self._looks_complete(text):
+        result = job.accept(text) if text else None
+        if result is not None:
             self._record_success(state)
-            return text.strip(), False
+            return result, False
 
-        # An empty reply and one that stops mid-sentence are the same
-        # failure (observed live: finishReason STOP well under the token
-        # budget, cut off mid-thought) -- never served as a finished fact.
-        # The key worked, so this doesn't count against it.
-        logger.warning(f"Gemini returned an empty or incomplete response for {name}")
+        # The key worked, so a rejected reply doesn't count against it.
+        logger.warning(f"Gemini returned an unusable response for {job.name}")
         return None, True
+
+    @classmethod
+    def _accept_sentence(cls, text: str) -> Optional[str]:
+        """Accepts a reply only if it's a complete sentence. An empty reply
+        and one that stops mid-sentence are the same failure (observed live:
+        finishReason STOP well under the token budget, cut off mid-thought)
+        -- never served as a finished fact."""
+        return text.strip() if cls._looks_complete(text) else None
 
     @staticmethod
     def _looks_complete(text: str) -> bool:
@@ -368,9 +425,15 @@ class GeminiClient:
     def _auth_headers(api_key: str) -> Dict[str, str]:
         return {"x-goog-api-key": api_key}
 
-    def _post(self, api_key: str, model: str, prompt: str) -> str:
+    def _post(
+        self,
+        api_key: str,
+        model: str,
+        prompt: str,
+        response_schema: Optional[dict] = None,
+    ) -> str:
         """Isolated so tests can monkeypatch this one method instead of the
-        network layer.
+        network layer. With ``response_schema``, asks for JSON mode.
 
         Raises:
             _KeyUnavailableError: The key was refused (401, 403, 429).
@@ -379,23 +442,32 @@ class GeminiClient:
             Exception: Any other network, HTTP, or parsing failure.
         """
         url = f"{self._BASE_URL}/models/{model}:generateContent"
+        generation_config: Dict[str, Any] = {
+            "temperature": 0.2,
+            "maxOutputTokens": self._MAX_OUTPUT_TOKENS,
+            # Several current Gemini models spend their whole output
+            # budget on invisible reasoning unless this is disabled. A
+            # grounded description needs no extended reasoning; this also
+            # roughly quarters real token usage.
+            "thinkingConfig": {"thinkingBudget": 0},
+        }
+        if response_schema is not None:
+            generation_config.update(
+                responseMimeType="application/json",
+                responseSchema=response_schema,
+                maxOutputTokens=self._MAX_JSON_OUTPUT_TOKENS,
+            )
         body = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": self._MAX_OUTPUT_TOKENS,
-                # Several current Gemini models spend their whole output
-                # budget on invisible reasoning unless this is disabled. A
-                # one-sentence grounded description needs no extended
-                # reasoning; this also roughly quarters real token usage.
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
+            "generationConfig": generation_config,
         }
 
         response = requests.post(
             url, json=body, headers=self._auth_headers(api_key), timeout=self.timeout_s
         )
-        if response.status_code in self._KEY_REJECTED_STATUSES:
+        if response.status_code in self._KEY_REJECTED_STATUSES or _is_invalid_key(
+            response
+        ):
             raise _KeyUnavailableError(f"HTTP {response.status_code}")
         if response.status_code in self._MODEL_UNAVAILABLE_STATUSES:
             raise _ModelUnavailableError(
@@ -409,6 +481,21 @@ class GeminiClient:
             raise ValueError("Gemini returned no candidates")
         parts = candidates[0].get("content", {}).get("parts") or []
         return parts[0].get("text", "") if parts else ""
+
+
+def _is_invalid_key(response: requests.Response) -> bool:
+    """Google reports a revoked or mistyped key as HTTP 400 with reason
+    API_KEY_INVALID -- the same status as a model rejecting the request's
+    configuration, so the reason is what tells them apart."""
+    if response.status_code != 400:
+        return False
+    try:
+        details = response.json().get("error", {}).get("details") or []
+    except Exception:
+        return False
+    return any(
+        d.get("reason") == "API_KEY_INVALID" for d in details if isinstance(d, dict)
+    )
 
 
 def _error_message(response: requests.Response) -> str:
