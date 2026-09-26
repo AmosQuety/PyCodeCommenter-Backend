@@ -49,6 +49,22 @@ class UserDailyQuota:
             self._used[client_id] = used
             return self.max_per_client - used
 
+    def refund(self, client_id: str) -> int:
+        """Gives one draft back, for a request that produced no usable
+        answer (never past the full allowance).
+
+        Args:
+            client_id (str): The client's identity (its IP address).
+
+        Returns:
+            int: Drafts remaining after the refund.
+        """
+        with self._lock:
+            self._reset_if_new_day()
+            used = max(self._used.get(client_id, 0) - 1, 0)
+            self._used[client_id] = used
+            return self.max_per_client - used
+
     def seconds_until_reset(self) -> int:
         """Seconds until the next UTC midnight, for a `Retry-After` header."""
         return seconds_until_utc_midnight()

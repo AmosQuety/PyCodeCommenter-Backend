@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
@@ -66,9 +66,10 @@ def draft_description() -> Response:
     except (KeyError, TypeError) as e:
         return _malformed(str(e))
 
-    def draft() -> dict:
+    def draft() -> Tuple[dict, Optional[bool]]:
         client = current_app.config["GEMINI_CLIENT"]
-        return {"description": client.draft_description(draft_request)}
+        # /v1 cannot tell a decline from a failure: no outcome is reported.
+        return {"description": client.draft_description(draft_request)}, None
 
     return _with_allowance(draft_request.name, draft, lambda b: bool(b["description"]))
 
@@ -84,7 +85,7 @@ def draft_docstring() -> Response:
     except ValueError as e:
         return _malformed(str(e))
 
-    def draft() -> dict:
+    def draft() -> Tuple[dict, Optional[bool]]:
         client = current_app.config["GEMINI_CLIENT"]
         result = client.draft_json(
             build_docstring_prompt(docstring_request),
@@ -92,7 +93,9 @@ def draft_docstring() -> Response:
             accept=lambda raw: _accept_draft(raw, docstring_request),
             name=docstring_request.facts.name,
         )
-        return result or parse_docstring_draft("", docstring_request)
+        if result is None:
+            return parse_docstring_draft("", docstring_request), True
+        return result, False
 
     return _with_allowance(docstring_request.facts.name, draft, has_any_draft)
 
@@ -108,7 +111,7 @@ def draft_class_docstring() -> Response:
     except ValueError as e:
         return _malformed(str(e))
 
-    def draft() -> dict:
+    def draft() -> Tuple[dict, Optional[bool]]:
         client = current_app.config["GEMINI_CLIENT"]
         result = client.draft_json(
             build_class_prompt(class_request),
@@ -116,7 +119,9 @@ def draft_class_docstring() -> Response:
             accept=lambda raw: _accept_class_draft(raw, class_request),
             name=class_request.name,
         )
-        return result or parse_class_draft("", class_request)
+        if result is None:
+            return parse_class_draft("", class_request), True
+        return result, False
 
     return _with_allowance(class_request.name, draft, has_any_class_draft)
 
@@ -134,7 +139,9 @@ def _accept_draft(raw: str, docstring_request: DocstringDraftRequest) -> Optiona
 
 
 def _with_allowance(
-    name: str, draft: Callable[[], dict], succeeded: Callable[[dict], bool]
+    name: str,
+    draft: Callable[[], Tuple[dict, Optional[bool]]],
+    succeeded: Callable[[dict], bool],
 ) -> Response:
     """Runs one draft under the caller's allowance and the shared daily cap.
 
@@ -143,7 +150,12 @@ def _with_allowance(
 
     Args:
         name (str): The function name, for logging only.
-        draft (Callable[[], dict]): Produces the response body.
+        draft (Callable[[], Tuple[dict, Optional[bool]]]): Produces the
+            response body and whether the draft failed (no model gave a
+            usable answer: an error, an overload or unusable output), or
+            ``None`` for that when the endpoint cannot tell. A failed draft
+            is marked ``X-AI-Draft-Outcome: failed`` and does not use up
+            the caller's allowance.
         succeeded (Callable[[dict], bool]): Whether the body holds a draft,
             for logging only.
 
@@ -174,15 +186,21 @@ def _with_allowance(
 
     remaining = quota.consume(client_id)
     started = time.monotonic()
-    body = draft()
+    body, failed = draft()
+    if failed:
+        # Nothing usable was produced, so it must not cost the caller.
+        remaining = quota.refund(client_id)
     logger.info(
         "draft name=%s outcome=%s latency_ms=%s forwarded_hops=%s",
         name,
-        "success" if succeeded(body) else "decline",
+        "failed" if failed else "success" if succeeded(body) else "decline",
         round((time.monotonic() - started) * 1000, 1),
         _forwarded_hop_count(),
     )
-    return _with_quota_headers(jsonify(body), quota, remaining)
+    response = _with_quota_headers(jsonify(body), quota, remaining)
+    if failed is not None:
+        response.headers["X-AI-Draft-Outcome"] = "failed" if failed else "ok"
+    return response
 
 
 def _forwarded_hop_count() -> int:

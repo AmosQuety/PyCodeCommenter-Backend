@@ -215,8 +215,11 @@ def test_client_allowance_exhausted_returns_429_pointing_to_own_key(
 
 def test_v1_counts_against_the_same_allowance(client, app, valid_payload, monkeypatch):
     _stub_model(app, monkeypatch, output="A function.")
-
     client.post("/v1/draft-description", json=valid_payload)
+
+    # A /v2 answer that is usable, so it is charged (an unusable one is
+    # refunded, see the failed-draft tests below).
+    _stub_model(app, monkeypatch, output=V2_MODEL_OUTPUT)
     response = client.post("/v2/draft-docstring", json=V2_PAYLOAD)
 
     limit = int(response.headers["X-AI-Drafts-Limit"])
@@ -263,3 +266,70 @@ def test_spoofed_leading_forwarded_address_does_not_grant_a_new_allowance(
     assert int(second.headers["X-AI-Drafts-Remaining"]) == (
         int(first.headers["X-AI-Drafts-Remaining"]) - 1
     )
+
+
+# ---------------------------------------------------------------------------
+# A failed draft is marked, and does not use up the caller's allowance
+# ---------------------------------------------------------------------------
+
+CLASS_PAYLOAD = {
+    "name": "Cache",
+    "attributes": [{"name": "_items", "type_hint": "dict"}],
+    "source": "class Cache:\n    def __init__(self):\n        self._items = {}",
+    "slots": {"summary": True, "attributes": ["_items"]},
+}
+
+
+def _limit(client):
+    return client.application.config["USER_QUOTA"].max_per_client
+
+
+def test_v2_failed_draft_is_marked_and_not_charged(client, app, monkeypatch):
+    _stub_model(app, monkeypatch, output="not json")
+
+    response = client.post("/v2/draft-docstring", json=V2_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.headers["X-AI-Draft-Outcome"] == "failed"
+    assert response.headers["X-AI-Drafts-Remaining"] == str(_limit(client))
+    assert app.config["USER_QUOTA"].remaining("127.0.0.1") == _limit(client)
+
+
+def test_v2_successful_draft_is_marked_ok_and_charged(client, app, monkeypatch):
+    _stub_model(app, monkeypatch)
+
+    response = client.post("/v2/draft-docstring", json=V2_PAYLOAD)
+
+    assert response.headers["X-AI-Draft-Outcome"] == "ok"
+    assert response.headers["X-AI-Drafts-Remaining"] == str(_limit(client) - 1)
+
+
+def test_class_failed_draft_is_marked_and_not_charged(client, app, monkeypatch):
+    _stub_model(app, monkeypatch, output="not json")
+
+    response = client.post("/v2/draft-class-docstring", json=CLASS_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.headers["X-AI-Draft-Outcome"] == "failed"
+    assert app.config["USER_QUOTA"].remaining("127.0.0.1") == _limit(client)
+
+
+def test_class_successful_draft_is_marked_ok(client, app, monkeypatch):
+    output = json.dumps({"summary": "Keep results.", "attributes": {"_items": "Stored."}})
+    _stub_model(app, monkeypatch, output=output)
+
+    response = client.post("/v2/draft-class-docstring", json=CLASS_PAYLOAD)
+
+    assert response.headers["X-AI-Draft-Outcome"] == "ok"
+
+
+def test_repeated_failures_never_exhaust_the_allowance(client, app, monkeypatch):
+    _stub_model(app, monkeypatch, output="not json")
+    limit = _limit(client)
+
+    codes = [
+        client.post("/v2/draft-docstring", json=V2_PAYLOAD).status_code
+        for _ in range(limit + 3)
+    ]
+
+    assert set(codes) == {200}
