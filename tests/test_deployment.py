@@ -38,3 +38,14 @@ def test_trusted_proxy_hops_matches_what_render_really_adds():
     index = next(i for i, l in enumerate(lines) if "key: TRUSTED_PROXY_HOPS" in l)
 
     assert 'value: "3"' in lines[index + 1]
+
+
+def test_render_paces_each_caller_below_gemini_free_tier_per_minute_limit():
+    """The free tier allows 5 requests a minute per model (measured
+    2026-09-27). The client waits out this limit once and carries on, so a
+    directory run slows down instead of failing on Gemini's 429."""
+    text = (ROOT / "render.yaml").read_text()
+    lines = text.splitlines()
+    index = next(i for i, l in enumerate(lines) if "key: RATE_LIMIT" in l)
+
+    assert 'value: "5 per minute"' in lines[index + 1]

@@ -8,6 +8,7 @@ from gemini_client import (
     ParameterFact,
     _KeyUnavailableError,
     _ModelUnavailableError,
+    _QuotaExceededError,
     draft_request_from_dict,
 )
 
@@ -92,7 +93,7 @@ def test_all_keys_exhausted_returns_none(monkeypatch):
     assert client.draft_description(make_request()) is None
 
 
-def test_429_opens_circuit_and_skips_key_on_next_call(monkeypatch):
+def test_a_rejected_key_opens_its_circuit_and_is_skipped_on_the_next_call(monkeypatch):
     client = make_client(api_keys=["key-1", "key-2"])
     calls = []
 
@@ -392,7 +393,7 @@ def test_model_listing_sends_key_in_a_header(monkeypatch):
     assert captured["headers"]["x-goog-api-key"] == "secret-key"
 
 
-@pytest.mark.parametrize("status", [401, 403, 429])
+@pytest.mark.parametrize("status", [401, 403])
 def test_key_rejections_raise_key_unavailable(monkeypatch, status):
     _capture_post(monkeypatch, _FakeResponse(status))
 
@@ -411,7 +412,7 @@ def test_model_failures_raise_model_unavailable(monkeypatch, status):
         make_client()._post("key-1", "fake-model", "prompt")
 
 
-@pytest.mark.parametrize("status", [401, 429])
+@pytest.mark.parametrize("status", [401, 403])
 def test_key_rejection_opens_only_that_keys_circuit(monkeypatch, status):
     client = make_client(api_keys=["key-1", "key-2"])
 
@@ -504,3 +505,159 @@ def test_rejected_reply_moves_on_to_the_next_model(monkeypatch):
     assert result == '{"ok": true}'
     assert calls == ["m1", "m2"]
     assert client._key_states["key-1"].open_until is None
+
+
+# ---------------------------------------------------------------------------
+# A quota 429 rests one model on one key, not the whole key
+# ---------------------------------------------------------------------------
+# Google counts free-tier quota per project and per model (5 requests a
+# minute, 20 a day on the models seen live), so a 429 says "this model, on
+# this key, for a while", and other models still have their own allowance.
+
+
+def _quota_body(retry_delay=None, quota_id=None):
+    details = []
+    if retry_delay is not None:
+        details.append(
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay}
+        )
+    if quota_id is not None:
+        details.append(
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [{"quotaId": quota_id}],
+            }
+        )
+    return {"error": {"code": 429, "message": "quota", "details": details}}
+
+
+def _wait_from_429(monkeypatch, body):
+    _capture_post(monkeypatch, _FakeResponse(429, body))
+    with pytest.raises(_QuotaExceededError) as raised:
+        make_client()._post("key-1", "fake-model", "prompt")
+    return raised.value.wait_s
+
+
+def test_a_429_is_a_quota_error_not_a_key_rejection(monkeypatch):
+    _capture_post(monkeypatch, _FakeResponse(429))
+
+    with pytest.raises(_QuotaExceededError):
+        make_client()._post("key-1", "fake-model", "prompt")
+
+
+def test_the_wait_follows_the_retry_delay_google_gives(monkeypatch):
+    assert _wait_from_429(monkeypatch, _quota_body(retry_delay="17s")) == 17
+
+
+def test_a_fractional_retry_delay_is_rounded_up(monkeypatch):
+    assert _wait_from_429(monkeypatch, _quota_body(retry_delay="17.2s")) == 18
+
+
+def test_a_tiny_retry_delay_still_waits_a_second(monkeypatch):
+    assert _wait_from_429(monkeypatch, _quota_body(retry_delay="0s")) == 1
+
+
+def test_an_unstated_delay_defaults_to_a_minute(monkeypatch):
+    assert _wait_from_429(monkeypatch, {}) == GeminiClient._DEFAULT_QUOTA_WAIT_S
+
+
+def test_a_spent_daily_quota_rests_the_model_for_an_hour(monkeypatch):
+    body = _quota_body(
+        retry_delay="20s", quota_id="GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    )
+
+    assert _wait_from_429(monkeypatch, body) == GeminiClient._MAX_QUOTA_WAIT_S
+
+
+def test_an_enormous_retry_delay_is_capped(monkeypatch):
+    assert (
+        _wait_from_429(monkeypatch, _quota_body(retry_delay="999999s"))
+        == GeminiClient._MAX_QUOTA_WAIT_S
+    )
+
+
+def test_a_quota_429_falls_through_to_the_next_model_on_the_same_key(monkeypatch):
+    client = _discovering_client(monkeypatch)
+    calls = []
+
+    def fake_post(key, model, prompt, schema=None):
+        calls.append((key, model))
+        if model == "m1":
+            raise _QuotaExceededError(30)
+        return "Drafted by m2."
+
+    monkeypatch.setattr(client, "_post", fake_post)
+
+    assert client.draft_description(make_request()) == "Drafted by m2."
+    assert calls == [("key-1", "m1"), ("key-1", "m2")]
+
+
+def test_a_quota_429_does_not_open_the_keys_circuit(monkeypatch):
+    client = _discovering_client(monkeypatch)
+
+    def fake_post(key, model, prompt, schema=None):
+        raise _QuotaExceededError(30)
+
+    monkeypatch.setattr(client, "_post", fake_post)
+
+    assert client.draft_description(make_request()) is None
+    assert client._key_states["key-1"].open_until is None
+
+
+def test_a_rested_model_is_skipped_until_its_wait_is_over(monkeypatch):
+    client = _discovering_client(monkeypatch)
+    now = [1000.0]
+    monkeypatch.setattr("gemini_client.time.monotonic", lambda: now[0])
+    calls = []
+
+    def fake_post(key, model, prompt, schema=None):
+        calls.append(model)
+        if model == "m1" and now[0] < 1010:  # m1 is out of quota at first
+            raise _QuotaExceededError(30)
+        return f"Drafted by {model}."
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    client.draft_description(make_request())
+    calls.clear()
+
+    assert client.draft_description(make_request()) == "Drafted by m2."
+    assert calls == ["m2"]  # m1 is resting, not asked again
+
+    now[0] += 31
+    calls.clear()
+
+    assert client.draft_description(make_request()) == "Drafted by m1."
+    assert calls == ["m1"]
+
+
+def test_the_rest_is_per_key_because_quota_is_per_project(monkeypatch):
+    client = _discovering_client(monkeypatch, api_keys=("key-1", "key-2"))
+    calls = []
+
+    def fake_post(key, model, prompt, schema=None):
+        calls.append((key, model))
+        if key == "key-1":
+            raise _QuotaExceededError(60)
+        return "Drafted by key-2."
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    client.draft_description(make_request())
+    calls.clear()
+
+    assert client.draft_description(make_request()) == "Drafted by key-2."
+    # key-1 rests on both models; key-2's own allowance is untouched.
+    assert all(key == "key-2" for key, _ in calls)
+
+
+def test_a_rejected_key_still_opens_its_circuit(monkeypatch):
+    client = _discovering_client(monkeypatch, api_keys=("key-1", "key-2"))
+
+    def fake_post(key, model, prompt, schema=None):
+        if key == "key-1":
+            raise _KeyUnavailableError("HTTP 403")
+        return "Drafted by key-2."
+
+    monkeypatch.setattr(client, "_post", fake_post)
+
+    assert client.draft_description(make_request()) == "Drafted by key-2."
+    assert client._key_states["key-1"].open_until is not None
