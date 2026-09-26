@@ -238,3 +238,43 @@ def test_schema_caps_every_text_field_and_asks_for_the_summary_first():
     assert props["raises"]["properties"]["ValueError"]["maxLength"] == 300
     assert schema["propertyOrdering"][0] == "summary"
     assert all(props[name].get("description") for name in ("summary", "returns"))
+
+
+# ---------------------------------------------------------------------------
+# Star parameters
+# ---------------------------------------------------------------------------
+
+STAR_PARAMETERS = [
+    {"name": "base", "type_hint": "dict", "default": None},
+    {"name": "*layers", "type_hint": "tuple", "default": None},
+    {"name": "**extra", "type_hint": "dict", "default": None},
+]
+
+
+def parse_star(output):
+    request = docstring_request_from_dict(
+        make_payload(
+            parameters=STAR_PARAMETERS,
+            raised_exceptions=[],
+            slots={"params": ["base", "*layers", "**extra"]},
+        )
+    )
+    return parse_docstring_draft(json.dumps(output), request)
+
+
+def test_a_reply_that_drops_the_stars_still_answers_star_parameters():
+    result = parse_star(
+        {"params": {"base": "B.", "layers": "Mappings merged in.", "extra": "More."}}
+    )
+
+    assert result["params"] == {
+        "base": "B.",
+        "*layers": "Mappings merged in.",
+        "**extra": "More.",
+    }
+
+
+def test_an_exact_starred_key_wins_over_the_unstarred_one():
+    result = parse_star({"params": {"*layers": "Exact.", "layers": "Loose."}})
+
+    assert result["params"] == {"*layers": "Exact."}

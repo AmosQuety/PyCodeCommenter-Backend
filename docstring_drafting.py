@@ -304,8 +304,17 @@ def _slot(
 def _named_slots(value: Any, requested: List[str]) -> Dict[str, str]:
     if not isinstance(value, dict):
         return {}
-    accepted = {name: clean_slot_text(value.get(name)) for name in requested}
+    accepted = {name: clean_slot_text(_answer_for(value, name)) for name in requested}
     return {name: text for name, text in accepted.items() if text}
+
+
+def _answer_for(reply: dict, name: str) -> Any:
+    """The reply's entry for ``name``. A model may drop the stars from
+    ``*args``/``**kwargs``, so an exact key wins and the unstarred name is
+    the fallback."""
+    if name in reply:
+        return reply[name]
+    return reply.get(name.lstrip("*")) if name.startswith("*") else None
 
 
 def clean_slot_text(value: Any, max_chars: int = MAX_SLOT_CHARS) -> Optional[str]:
