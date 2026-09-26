@@ -208,8 +208,9 @@ def _forwarded_hop_count() -> int:
     never the addresses. Logged so TRUSTED_PROXY_HOPS can be checked against
     the real deployment: with no caller-supplied header, it should equal the
     configured number of trusted hops."""
-    original = request.environ.get("werkzeug.proxy_fix.orig", {})
-    forwarded = original.get("HTTP_X_FORWARDED_FOR") or ""
+    # The raw header: ProxyFix rewrites REMOTE_ADDR but leaves it untouched
+    # (its "orig" record never held it, which made this always report 0).
+    forwarded = request.headers.get("X-Forwarded-For") or ""
     return len([part for part in forwarded.split(",") if part.strip()])
 
 

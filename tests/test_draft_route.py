@@ -333,3 +333,40 @@ def test_repeated_failures_never_exhaust_the_allowance(client, app, monkeypatch)
     ]
 
     assert set(codes) == {200}
+
+
+# ---------------------------------------------------------------------------
+# The forwarded-hop count in the log is the real number of entries
+# ---------------------------------------------------------------------------
+
+
+def _logged_hops(client, app, monkeypatch, caplog, headers):
+    _stub_model(app, monkeypatch)
+    with caplog.at_level("INFO", logger="routes.draft"):
+        client.post("/v2/draft-docstring", json=V2_PAYLOAD, headers=headers)
+    line = next(r.getMessage() for r in caplog.records if "forwarded_hops=" in r.getMessage())
+    return int(line.split("forwarded_hops=")[1].split()[0])
+
+
+def test_the_logged_hop_count_is_the_number_of_forwarded_entries(
+    client, app, monkeypatch, caplog
+):
+    hops = _logged_hops(
+        client, app, monkeypatch, caplog, {"X-Forwarded-For": "203.0.113.7, 198.51.100.9"}
+    )
+
+    assert hops == 2
+
+
+def test_the_logged_hop_count_is_zero_without_the_header(
+    client, app, monkeypatch, caplog
+):
+    assert _logged_hops(client, app, monkeypatch, caplog, {}) == 0
+
+
+def test_the_log_never_contains_the_addresses(client, app, monkeypatch, caplog):
+    _logged_hops(
+        client, app, monkeypatch, caplog, {"X-Forwarded-For": "203.0.113.7, 198.51.100.9"}
+    )
+
+    assert "203.0.113.7" not in caplog.text and "198.51.100.9" not in caplog.text
