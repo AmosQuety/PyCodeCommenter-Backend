@@ -58,7 +58,7 @@ gunicorn "app:create_app()"
 | `RATE_LIMIT` | `10 per minute` | Per-IP request limit (Flask-Limiter syntax). |
 | `MAX_DAILY_CALLS` | `200` | Global daily cap across all callers, in-memory (resets on redeploy). |
 | `MAX_DAILY_CALLS_PER_USER` | `25` | Daily drafts per caller (by IP address), in-memory (resets on redeploy). |
-| `TRUSTED_PROXY_HOPS` | `1` | Proxies whose `X-Forwarded-For` entry is trusted to identify the caller. Render's load balancer is one. Too high lets callers spoof their address; too low makes every caller look like the proxy. |
+| `TRUSTED_PROXY_HOPS` | `1` | Proxies whose `X-Forwarded-For` entry is trusted to identify the caller: the app takes the entry that many from the right. **On Render this must be `3`** (measured: a request with no client header already arrives with three entries); the default of `1` suits a single proxy. Too high lets callers spoof their address; too low makes callers look like a proxy, and their allowance is split across whatever addresses the proxies use. The draft log line shows `forwarded_hops=N`, the number of entries seen. |
 | `GEMINI_MODEL` | *(auto-discovered)* | Pin a specific model instead of discovering the best available ones. A pinned model has no fallback if it is overloaded. |
 | `REQUEST_TIMEOUT_S` | `15` | Per-request timeout to the Gemini API. |
 
