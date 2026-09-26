@@ -16,4 +16,4 @@ services:
       - key: MAX_DAILY_CALLS_PER_USER
         value: "25"
       - key: TRUSTED_PROXY_HOPS
-        value: "1"
+        value: "3"

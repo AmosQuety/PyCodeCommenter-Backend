@@ -26,3 +26,15 @@ def test_render_start_command_matches_the_procfile():
 
     assert "--workers 1" in render and "--threads" in render
     assert procfile.split("gunicorn", 1)[1] == render.split("gunicorn", 1)[1]
+
+
+def test_trusted_proxy_hops_matches_what_render_really_adds():
+    """Measured live (2026-09-27): a request with no client header already
+    arrives with three X-Forwarded-For entries, so the caller's address is
+    the third from the right. With 1, the app took Render's own last proxy,
+    whose address alternates, and split every caller across buckets."""
+    text = (ROOT / "render.yaml").read_text()
+    lines = text.splitlines()
+    index = next(i for i, l in enumerate(lines) if "key: TRUSTED_PROXY_HOPS" in l)
+
+    assert 'value: "3"' in lines[index + 1]
