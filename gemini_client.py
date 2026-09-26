@@ -30,6 +30,7 @@ it can't leak into exception messages or logs that print the URL.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -61,8 +62,24 @@ class DraftRequest:
 
 
 class _KeyUnavailableError(Exception):
-    """The key itself was refused: quota exhausted (429) or rejected
-    (401/403). Other keys may still work; this one should rest."""
+    """The key itself was refused: rejected or revoked (401/403, invalid
+    key). Other keys may still work; this one should rest."""
+
+
+class _QuotaExceededError(Exception):
+    """The model's quota on this key is used up for now (HTTP 429).
+
+    Google counts free-tier quota per project *and per model*, so this
+    rests one model on one key; the key's other models still have their own
+    allowance, and so do other keys.
+
+    Attributes:
+        wait_s (float): How long to leave that model alone on that key.
+    """
+
+    def __init__(self, wait_s: float):
+        super().__init__(f"quota exceeded, resting {wait_s:.0f}s")
+        self.wait_s = wait_s
 
 
 class _ModelUnavailableError(Exception):
@@ -113,6 +130,10 @@ class GeminiClient:
     _FAILURE_THRESHOLD = 2
     _COOLDOWN_S = 60.0
     _MODEL_COOLDOWN_S = 60.0
+    # A 429 rests that model on that key for Google's retryDelay: a minute
+    # when it gives none, and an hour when the daily quota is what is spent.
+    _DEFAULT_QUOTA_WAIT_S = 60.0
+    _MAX_QUOTA_WAIT_S = 3600.0
     _MAX_OUTPUT_TOKENS = 200
     # A structured draft fills several slots in one reply.
     _MAX_JSON_OUTPUT_TOKENS = 1024
@@ -122,7 +143,7 @@ class GeminiClient:
     _MAX_ATTEMPTS_PER_REQUEST = 6
     _MAX_CANDIDATE_MODELS = 3
 
-    _KEY_REJECTED_STATUSES = frozenset({401, 403, 429})
+    _KEY_REJECTED_STATUSES = frozenset({401, 403})
     _MODEL_UNAVAILABLE_STATUSES = frozenset({400, 404, 500, 503, 504})
 
     _PREFERRED_MODELS = ("gemini-flash-latest", "gemini-2.5-flash")
@@ -158,6 +179,8 @@ class GeminiClient:
         }
         self._model_cache: Dict[str, Tuple[List[str], float]] = {}
         self._model_cooldown_until: Dict[str, float] = {}
+        # Quota rests are per (key, model): quota is per project and model.
+        self._quota_rest_until: Dict[Tuple[str, str], float] = {}
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -248,6 +271,13 @@ class GeminiClient:
             logger.warning(f"Gemini key rejected while drafting {job.name}: {e}")
             self._open_circuit(state)
             return None, False
+        except _QuotaExceededError as e:
+            logger.warning(
+                f"Gemini quota reached on {model} while drafting {job.name}; "
+                f"resting it for {e.wait_s:.0f}s"
+            )
+            self._quota_rest_until[(key, model)] = time.monotonic() + e.wait_s
+            return None, False
         except _ModelUnavailableError as e:
             logger.warning(f"Gemini model unavailable while drafting {job.name}: {e}")
             self._model_cooldown_until[model] = (
@@ -298,9 +328,16 @@ class GeminiClient:
     # ── Circuit breaker and model cooldown ───────────────────────────────
 
     def _is_usable(self, key: str, model: str) -> bool:
+        now = time.monotonic()
         cooling_until = self._model_cooldown_until.get(model)
-        model_cooling = cooling_until is not None and time.monotonic() < cooling_until
-        return not model_cooling and not self._is_circuit_open(self._key_states[key])
+        model_cooling = cooling_until is not None and now < cooling_until
+        resting_until = self._quota_rest_until.get((key, model))
+        model_resting = resting_until is not None and now < resting_until
+        return (
+            not model_cooling
+            and not model_resting
+            and not self._is_circuit_open(self._key_states[key])
+        )
 
     def _is_circuit_open(self, state: _KeyCircuitState) -> bool:
         return state.open_until is not None and time.monotonic() < state.open_until
@@ -428,6 +465,20 @@ class GeminiClient:
     def _auth_headers(api_key: str) -> Dict[str, str]:
         return {"x-goog-api-key": api_key}
 
+    @classmethod
+    def _quota_wait_seconds(cls, response: requests.Response) -> float:
+        """How long to rest a model after a 429: Google's retryDelay rounded
+        up (at least a second), a default when it gives none, and the cap
+        when the *daily* quota is what is spent (a short delay would only
+        fail again)."""
+        details = _quota_details(response)
+        if _daily_quota_spent(details):
+            return cls._MAX_QUOTA_WAIT_S
+        delay = _retry_delay_seconds(details)
+        if delay is None:
+            return cls._DEFAULT_QUOTA_WAIT_S
+        return float(min(max(math.ceil(delay), 1), cls._MAX_QUOTA_WAIT_S))
+
     def _post(
         self,
         api_key: str,
@@ -439,7 +490,9 @@ class GeminiClient:
         network layer. With ``response_schema``, asks for JSON mode.
 
         Raises:
-            _KeyUnavailableError: The key was refused (401, 403, 429).
+            _KeyUnavailableError: The key was refused (401, 403, invalid key).
+            _QuotaExceededError: The model's quota on this key is used up
+                (429), with how long to leave it alone.
             _ModelUnavailableError: The model couldn't serve the request
                 (400, 404, 500, 503, 504).
             Exception: Any other network, HTTP, or parsing failure.
@@ -468,6 +521,8 @@ class GeminiClient:
         response = requests.post(
             url, json=body, headers=self._auth_headers(api_key), timeout=self.timeout_s
         )
+        if response.status_code == 429:
+            raise _QuotaExceededError(self._quota_wait_seconds(response))
         if response.status_code in self._KEY_REJECTED_STATUSES or _is_invalid_key(
             response
         ):
@@ -484,6 +539,35 @@ class GeminiClient:
             raise ValueError("Gemini returned no candidates")
         parts = candidates[0].get("content", {}).get("parts") or []
         return parts[0].get("text", "") if parts else ""
+
+
+def _quota_details(response: requests.Response) -> list:
+    try:
+        details = response.json().get("error", {}).get("details") or []
+    except Exception:
+        return []
+    return [d for d in details if isinstance(d, dict)]
+
+
+def _retry_delay_seconds(details: list) -> Optional[float]:
+    """Google's ``RetryInfo.retryDelay`` (for example ``"17s"``), if any."""
+    for detail in details:
+        raw = detail.get("retryDelay")
+        if isinstance(raw, str) and raw.endswith("s"):
+            try:
+                return float(raw[:-1])
+            except ValueError:
+                return None
+    return None
+
+
+def _daily_quota_spent(details: list) -> bool:
+    return any(
+        "PerDay" in str(violation.get("quotaId", ""))
+        for detail in details
+        for violation in detail.get("violations") or []
+        if isinstance(violation, dict)
+    )
 
 
 def _is_invalid_key(response: requests.Response) -> bool:
