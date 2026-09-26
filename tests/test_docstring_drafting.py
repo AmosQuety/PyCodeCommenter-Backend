@@ -166,6 +166,52 @@ def test_summary_longer_than_one_line_is_declined():
     assert parse({"summary": "Compute " + "a" * 100 + "."})["summary"] is None
 
 
+NO_ANSWER_TEXTS = [
+    "null",
+    "NULL",
+    "Null.",
+    "none",
+    "None.",
+    "n/a",
+    "N/A",
+    "nil",
+    "undefined",
+]
+
+
+@pytest.mark.parametrize("text", NO_ANSWER_TEXTS)
+def test_the_text_null_is_a_declined_slot_not_an_answer(text):
+    result = parse(
+        {
+            "summary": text,
+            "description": text,
+            "params": {"discount": text},
+            "returns": text,
+            "raises": {"ValueError": text},
+        },
+    )
+
+    assert result == {
+        "summary": None,
+        "description": None,
+        "params": {},
+        "returns": None,
+        "raises": {},
+    }
+
+
+def test_sentences_that_only_mention_null_are_kept():
+    result = parse({"returns": "Returns None when the invoice is empty."})
+
+    assert result["returns"] == "Returns None when the invoice is empty."
+
+
+def test_prompt_says_to_use_json_null_not_the_word():
+    prompt = build_docstring_prompt(docstring_request_from_dict(make_payload()))
+
+    assert 'JSON null, never the text "null"' in prompt
+
+
 @pytest.mark.parametrize("raw", ["not json", "[1, 2]", '{"params": "x"}'])
 def test_malformed_model_output_declines_everything(raw):
     request = docstring_request_from_dict(make_payload())
