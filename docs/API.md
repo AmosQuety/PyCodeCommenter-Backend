@@ -112,9 +112,53 @@ Every returned value is a single line, at most 300 characters (80 for
 `'''`, a backslash, `TODO`, or `AI-drafted`. A slot the model couldn't
 answer from the code is declined rather than guessed.
 
+## `POST /v2/draft-class-docstring`
+
+Drafts a class's summary and attribute descriptions in a single call. The
+client sends the class's facts, an outline of its source (header,
+class-level fields, `__init__` in full, other methods as signatures), the
+attribute text already known, and the slots it still needs:
+
+```json
+{
+  "name": "Cache",
+  "bases": ["Base"],
+  "attributes": [
+    {"name": "_items", "type_hint": "dict", "default": null},
+    {"name": "ttl", "type_hint": "int", "default": null}
+  ],
+  "source": "class Cache(Base):\n    def __init__(self, ttl): ...",
+  "known": {"attributes": {"ttl": "Seconds an entry stays valid."}},
+  "slots": {"summary": true, "attributes": ["_items"]}
+}
+```
+
+`slots.attributes` must name entries of `attributes`; at least one slot is
+required; `source` is capped at 20,000 characters. Anything else is a
+**400**, which costs no allowance.
+
+**Success — HTTP 200**, always with both keys. Declined slots are `null`,
+or absent from `attributes`:
+
+```json
+{
+  "summary": "Keep recent results for a limited time.",
+  "attributes": {"_items": "Cached values by key."}
+}
+```
+
+The same checks as `/v2/draft-docstring` apply to every value (single
+line, at most 300 characters, 80 for `summary`, no `"""`, `'''`, backslash,
+`TODO` or `AI-drafted`, and never just the text `null`/`none`/`n/a`/`nil`/
+`undefined`). A draft counts as one draft against the daily allowance, like
+a function draft, and shares its 429 responses.
+
+An older deployment without this endpoint answers **404**; the client
+remembers that and leaves class docstrings as they are.
+
 ## Daily allowance
 
-Both drafting endpoints count against a per-caller daily allowance (by IP
+All drafting endpoints count against a per-caller daily allowance (by IP
 address; 25 by default) and a shared daily cap. Every drafting response
 carries:
 

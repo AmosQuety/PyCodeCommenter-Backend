@@ -1,4 +1,5 @@
-"""POST /v1/draft-description, POST /v2/draft-docstring and GET /health.
+"""POST /v1/draft-description, POST /v2/draft-docstring,
+POST /v2/draft-class-docstring and GET /health.
 
 The wire contract (see docs/API.md): a decline or a drafting failure is
 still HTTP 200 with the unfilled slots empty -- an expected outcome, not a
@@ -21,6 +22,14 @@ from typing import Callable, Optional
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
+from class_drafting import (
+    ClassDraftRequest,
+    build_class_prompt,
+    class_request_from_dict,
+    class_response_schema,
+    has_any_class_draft,
+    parse_class_draft,
+)
 from docstring_drafting import (
     DocstringDraftRequest,
     build_docstring_prompt,
@@ -86,6 +95,36 @@ def draft_docstring() -> Response:
         return result or parse_docstring_draft("", docstring_request)
 
     return _with_allowance(docstring_request.facts.name, draft, has_any_draft)
+
+
+@bp.post("/v2/draft-class-docstring")
+@limiter.limit(lambda: current_app.config["RATE_LIMIT"])
+def draft_class_docstring() -> Response:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _malformed("Request body must be a JSON object")
+    try:
+        class_request = class_request_from_dict(data)
+    except ValueError as e:
+        return _malformed(str(e))
+
+    def draft() -> dict:
+        client = current_app.config["GEMINI_CLIENT"]
+        result = client.draft_json(
+            build_class_prompt(class_request),
+            class_response_schema(class_request),
+            accept=lambda raw: _accept_class_draft(raw, class_request),
+            name=class_request.name,
+        )
+        return result or parse_class_draft("", class_request)
+
+    return _with_allowance(class_request.name, draft, has_any_class_draft)
+
+
+def _accept_class_draft(raw: str, class_request: ClassDraftRequest) -> Optional[dict]:
+    """A reply with no usable slot is retried like any failed attempt."""
+    draft = parse_class_draft(raw, class_request)
+    return draft if has_any_class_draft(draft) else None
 
 
 def _accept_draft(raw: str, docstring_request: DocstringDraftRequest) -> Optional[dict]:
