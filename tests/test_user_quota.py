@@ -36,3 +36,35 @@ def test_allowances_reset_on_a_new_utc_day(monkeypatch):
     monkeypatch.setattr("middleware.user_quota.utc_today", lambda: tomorrow)
 
     assert quota.remaining("1.1.1.1") == 1
+
+
+# ---------------------------------------------------------------------------
+# Giving a draft back
+# ---------------------------------------------------------------------------
+
+
+def test_refund_gives_one_draft_back():
+    quota = UserDailyQuota(max_per_client=3)
+    quota.consume("a")
+    quota.consume("a")
+
+    assert quota.refund("a") == 2  # remaining after the refund
+    assert quota.remaining("a") == 2
+
+
+def test_refund_never_goes_past_the_full_allowance():
+    quota = UserDailyQuota(max_per_client=3)
+
+    assert quota.refund("a") == 3
+    assert quota.remaining("a") == 3
+
+
+def test_refund_only_affects_that_client():
+    quota = UserDailyQuota(max_per_client=3)
+    quota.consume("a")
+    quota.consume("b")
+
+    quota.refund("a")
+
+    assert quota.remaining("a") == 3
+    assert quota.remaining("b") == 2

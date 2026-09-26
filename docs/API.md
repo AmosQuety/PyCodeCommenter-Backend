@@ -166,6 +166,7 @@ carries:
 |---|---|
 | `X-AI-Drafts-Limit` | The caller's daily allowance. |
 | `X-AI-Drafts-Remaining` | Drafts left today, after this one. |
+| `X-AI-Draft-Outcome` | `ok`, or `failed` when no model gave a usable answer (an error, an overload, or unusable output). The reply is still HTTP 200 with empty slots, and a `failed` draft is **not** charged to the allowance. Sent by `/v2` endpoints only; `/v1` cannot tell the two apart. Absent means the service predates this header. |
 
 **Allowance used up — HTTP 429**, with `Retry-After` (seconds to the next
 UTC midnight):
